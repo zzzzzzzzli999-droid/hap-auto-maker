@@ -343,6 +343,50 @@ async function waitIdle(page, timeout = 20000) {
   check("页面无脚本错误（自动排序）", page.__errors.length === 0, page.__errors.join(" | "));
   await page.close();
 
+  // ---------- 6. 单栏全屏按钮 ----------
+  page = await open(browser);
+  const layout = () => page.evaluate(() => {
+    const box = (selector) => { const el = document.querySelector(selector); if (!el || getComputedStyle(el).display === "none") return null; const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; };
+    return { left: box(".unscheduled-board"), right: box(".scheduled-board"), cards: box(".machine-groups"), splitter: box(".board-splitter"), fullscreen: Boolean(document.fullscreenElement) };
+  });
+  const buttonInfo = await page.$$eval(".board-head", (heads) => heads.map((head) => {
+    const button = head.querySelector(".maximize-toggle"); const title = head.querySelector("h2");
+    return button && { title: button.getAttribute("title"), leftOfTitle: button.getBoundingClientRect().right <= title.getBoundingClientRect().left, svg: Boolean(button.querySelector("svg path")) };
+  }));
+  check("未排程、已排程标题左侧都有全屏按钮（斜向双箭头）", buttonInfo.length === 2 && buttonInfo.every((b) => b && b.leftOfTitle && b.svg), JSON.stringify(buttonInfo.map((b) => b && b.title)));
+  const normal = await layout();
+  await page.click(".unscheduled-board .maximize-toggle");
+  await page.waitForTimeout(200);
+  const maxLeft = await layout();
+  await page.screenshot({ path: path.join(__dirname, "shot-max-left.png") });
+  check("点击后未排程铺满插件区域（机床卡片和已排程隐藏）", maxLeft.left && maxLeft.left.w > 1380 && maxLeft.left.y < 20 && !maxLeft.right && !maxLeft.cards && !maxLeft.splitter, JSON.stringify(maxLeft));
+  check("全屏后按钮变为“还原”", (await page.getAttribute(".unscheduled-board .maximize-toggle", "title")).startsWith("还原"));
+  check("全屏后列表仍可滚动、可操作（行数不变）", (await page.$$(".unscheduled-board .schedule-row")).length > 0);
+  await page.click(".unscheduled-board .maximize-toggle");
+  await page.waitForTimeout(200);
+  const restored = await layout();
+  check("再点一次还原，布局与之前一致", JSON.stringify({ ...restored, fullscreen: false }) === JSON.stringify({ ...normal, fullscreen: false }), JSON.stringify(restored.left));
+  await page.click(".scheduled-board .maximize-toggle");
+  await page.waitForTimeout(200);
+  const maxRight = await layout();
+  await page.screenshot({ path: path.join(__dirname, "shot-max-right.png") });
+  check("已排程也可全屏", maxRight.right && maxRight.right.w > 1380 && !maxRight.left && !maxRight.cards, JSON.stringify(maxRight.right));
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(250);
+  const afterEsc = await layout();
+  check("按 Esc 还原", Boolean(afterEsc.left && afterEsc.right && afterEsc.cards), JSON.stringify({ left: Boolean(afterEsc.left), right: Boolean(afterEsc.right) }));
+  await page.dblclick(".board-splitter");
+  await page.waitForTimeout(150);
+  await page.click(".scheduled-board .maximize-toggle");
+  await page.waitForTimeout(150);
+  const maxWhileHidden = await layout();
+  await page.click(".scheduled-board .maximize-toggle");
+  await page.waitForTimeout(150);
+  const backToHidden = await layout();
+  check("与双击隐藏互不干扰（隐藏左栏时全屏右栏，还原后仍是隐藏左栏）", maxWhileHidden.right && !maxWhileHidden.cards && !backToHidden.left && backToHidden.right && backToHidden.cards, JSON.stringify({ hiddenThenMax: Boolean(maxWhileHidden.right), back: { left: Boolean(backToHidden.left), right: Boolean(backToHidden.right) } }));
+  check("页面无脚本错误（全屏）", page.__errors.length === 0, page.__errors.join(" | "));
+  await page.close();
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} passed`);
   await browser.close();

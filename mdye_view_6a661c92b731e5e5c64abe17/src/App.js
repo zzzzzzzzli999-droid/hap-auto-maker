@@ -844,6 +844,8 @@ export default function App() {
   const [leftWidth, setLeftWidth] = useState(39);
   // 双击中间分隔线循环：0 两栏 → 1 隐藏左栏 → 2 两栏 → 3 隐藏右栏 → 0
   const [paneStep, setPaneStep] = useState(0);
+  // 单栏全屏：""（不全屏）| "queued"（未排程全屏）| "scheduled"（已排程全屏）
+  const [maximizedLane, setMaximizedLane] = useState("");
   const [splitTarget, setSplitTarget] = useState(null);
   const [splitAmount, setSplitAmount] = useState("");
   const [confirmingSchedule, setConfirmingSchedule] = useState(false);
@@ -1848,6 +1850,42 @@ export default function App() {
   };
 
   const hiddenPane = paneStep === 1 ? "left" : paneStep === 3 ? "right" : "";
+  // 标题左侧的斜向双箭头：该栏铺满整个插件区域（隐藏机床卡片和另一栏），浏览器允许时同时进入全屏；再点或按 Esc 还原。
+  const toggleMaximize = (lane) => {
+    const next = maximizedLane === lane ? "" : lane;
+    setMaximizedLane(next);
+    try {
+      if (next && !document.fullscreenElement && document.fullscreenEnabled && document.documentElement.requestFullscreen) {
+        document.documentElement.requestFullscreen().catch(() => undefined);
+      }
+      if (!next && document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => undefined);
+    } catch (_) {}
+  };
+
+  useEffect(() => {
+    if (!maximizedLane) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape" && !document.querySelector(".modal-backdrop")) setMaximizedLane("");
+    };
+    // 在浏览器全屏里按 Esc 会直接退出全屏，这时一并还原。
+    const onFullscreenChange = () => { if (!document.fullscreenElement) setMaximizedLane(""); };
+    window.addEventListener("keydown", onKeyDown);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+    };
+  }, [maximizedLane]);
+
+  const maximizeButton = (lane, label) => {
+    const active = maximizedLane === lane;
+    return <button type="button" className={`maximize-toggle ${active ? "active" : ""}`} onClick={() => toggleMaximize(lane)} title={active ? "还原（Esc）" : `全屏显示${label}`} aria-label={active ? "还原" : `全屏显示${label}`} aria-pressed={active}>
+      <svg aria-hidden="true" viewBox="0 0 20 20">{active
+        ? <path d="M16.5 3.5 11 9M11 4.5V9h4.5M3.5 16.5 9 11M9 15.5V11H4.5" />
+        : <path d="M4 16 16 4M10.5 4H16v5.5M9.5 16H4v-5.5" />}</svg>
+    </button>;
+  };
+
   const togglePanes = () => {
     const next = (paneStep + 1) % 4;
     setPaneStep(next);
@@ -1892,7 +1930,7 @@ export default function App() {
   };
 
   return (
-    <main className={`scheduler-shell ${loading && !rows.length ? "is-busy" : ""}`}>
+    <main className={`scheduler-shell ${loading && !rows.length ? "is-busy" : ""} ${maximizedLane ? `maximized maximize-${maximizedLane}` : ""}`}>
       <nav className="machine-groups" aria-label="按工序分组的机床分类">
         <button className={`all-machine ${activeMachineKey === "ALL" ? "active" : ""}`} onClick={() => changeMachine("ALL")}><span>全部机床</span><span className="status-counts"><b className="queued-count" title={`未排程 ${allStatusCounts.queued} 条`}>{allStatusCounts.queued}</b><b className="scheduled-count" title={`已排程 ${allStatusCounts.scheduled} 条`}>{allStatusCounts.scheduled}</b></span></button>
         {processGroups.map((group) => <div className="process-group" key={group.process}>
@@ -1911,7 +1949,7 @@ export default function App() {
 
       <section className={`boards ${hiddenPane ? `hide-${hiddenPane}` : ""}`} ref={boardsRef} style={{ "--left-width": `${leftWidth}%` }}>
         <div className={`board unscheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("queued", e)}>
-          <div className="board-head"><div><span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{activeMachineInfo && mergeTargetMachines.length > 0 && <button className="merge-machine-trigger" onClick={openMachineMerge}>合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button className="select-visible" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}>{selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("queued")} disabled={!unscheduled.length}><span>⇅</span> 自动排序</button></div></div>
+          <div className="board-head"><div>{maximizeButton("queued", "未排程")}<span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{activeMachineInfo && mergeTargetMachines.length > 0 && <button className="merge-machine-trigger" onClick={openMachineMerge}>合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button className="select-visible" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}>{selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("queued")} disabled={!unscheduled.length}><span>⇅</span> 自动排序</button></div></div>
           <div className="list-table">
             <div className="list-head" style={queuedTableStyle}><span key="drag" />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={queuedFilters[fieldKeys[index]]} options={() => queuedColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("queued", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
             <VirtualCardList rows={unscheduled} resetKey={activeMachineKey} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} selected={selectedRowIdSet.has(row.rowid)} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty"><strong>没有未排程任务</strong><span>当前机床暂无可排程订单</span></div>} />
@@ -1921,7 +1959,7 @@ export default function App() {
         <div className="board-splitter" onPointerDown={beginResize} onDoubleClick={togglePanes} title={hiddenPane ? "双击还原左右两栏" : "拖动调整左右区域宽度；双击隐藏/还原左右区域"}><span /></div>
 
         <div className={`board scheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("scheduled", e)}>
-          <div className="board-head"><div><span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em></div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button className="select-visible" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}>{selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><span>⇅</span> 自动排序</button><button className="confirm-schedule" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><span>✓</span>{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
+          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em></div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button className="select-visible" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}>{selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><span>⇅</span> 自动排序</button><button className="confirm-schedule" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><span>✓</span>{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
           <div className="list-table">
             <div className="list-head" style={tableStyle}><span key="drag" /><FilterHeader key="sequence" columnKey="__sequence" label="序号" value={scheduledFilters.sequence} options={() => scheduledColumnOptions("sequence")} onChange={(value) => setColumnFilter("scheduled", "sequence", value)} layoutLocked />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={scheduledFilters[fieldKeys[index]]} options={() => scheduledColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("scheduled", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
             <VirtualCardList rows={scheduled} resetKey={activeMachineKey} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} scheduled selected={selectedRowIdSet.has(row.rowid)} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty drop-empty"><strong>拖到这里开始排程</strong><span>任务会自动生成排程序号</span></div>} />

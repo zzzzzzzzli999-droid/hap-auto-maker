@@ -91,6 +91,16 @@ button { color: inherit; }
 .board-tools button.confirm-schedule { background: linear-gradient(#42a982, #268263); border-color: #1d7256; }
 .board-tools button.confirm-schedule:hover { box-shadow: 0 0 18px rgba(38, 130, 99, .25); }
 .board-tools button:disabled { cursor: not-allowed; filter: grayscale(.8); opacity: .45; box-shadow: none; }
+/* 标题左侧的全屏按钮（斜向双箭头）；全屏时只保留该栏 */
+.maximize-toggle { width: 26px; height: 26px; flex: none; display: grid; place-items: center; padding: 0; color: #1d6a9e; background: #f5fbff; border: 1px solid #8ebbd5; border-radius: 3px; cursor: pointer; }
+.maximize-toggle svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.maximize-toggle:hover, .maximize-toggle:focus-visible { color: #fff; background: #2d86c3; border-color: #1d70aa; outline: none; }
+.maximize-toggle.active { color: #fff; background: #1f6fb0; border-color: #175d95; }
+.scheduler-shell.maximized .machine-groups, .scheduler-shell.maximized .board-splitter { display: none; }
+.scheduler-shell.maximized .boards { grid-template-columns: minmax(0, 1fr); }
+.scheduler-shell.maximized .boards > .board { grid-column: 1; }
+.scheduler-shell.maximize-queued .boards > .scheduled-board, .scheduler-shell.maximize-scheduled .boards > .unscheduled-board { display: none; }
+.scheduler-shell.maximize-queued .boards > .unscheduled-board, .scheduler-shell.maximize-scheduled .boards > .scheduled-board { display: flex; }
 .dot { width: 8px; height: 8px; border-radius: 50%; }
 .dot.amber { background: #d59b48; box-shadow: 0 0 0 4px #fbefd8; }
 .dot.green { background: #2e7d64; box-shadow: 0 0 0 4px #dff0e8; }
