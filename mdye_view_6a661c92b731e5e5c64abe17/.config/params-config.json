@@ -23,6 +23,8 @@
   { "controlId": "quantity", "name": "数量字段", "type": "control" },
   { "controlId": "productionSize", "name": "生产尺寸字段", "type": "control", "required": true },
   { "controlId": "color", "name": "颜色字段（用于自动排序）", "type": "control" },
+  { "controlId": "dieCutPlate", "name": "模切版字段（用于自动排序）", "type": "control" },
+  { "controlId": "printingPlate", "name": "印刷版字段（用于自动排序）", "type": "control" },
   { "controlId": "material", "name": "材质字段", "type": "control" },
   { "controlId": "materialNo", "name": "料号字段", "type": "control" },
   { "controlId": "processRequirement", "name": "工艺要求字段", "type": "control" },

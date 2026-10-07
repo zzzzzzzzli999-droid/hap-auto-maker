@@ -42,6 +42,9 @@ const FIELD_ALIASES = {
   quantity: ["quantity", "数量", "生产数量"],
   productionSize: ["productionSize", "生产尺寸", "产品尺寸"],
   color: ["color", "颜色", "生产颜色", "印刷颜色"],
+  // 自动排序第 5 条：模切版 / 印刷版相同的排在一起（插件设置里可映射；未映射时按字段名自动识别）
+  dieCutPlate: ["dieCutPlate", "模切版", "模切版号", "刀版", "刀版号", "刀模", "刀模号"],
+  printingPlate: ["printingPlate", "印刷版", "印刷版号", "印版", "印版号"],
   material: ["material", "材质", "生产材质"],
   materialNo: ["materialNo", "料号"],
   processRequirement: ["processRequirement", "工艺要求"],
@@ -316,6 +319,8 @@ function normalizeRow(row) {
     quantity: cleanText(fieldValue(row, "quantity")) || "—",
     productionSize: cleanText(fieldValue(row, "productionSize")) || "—",
     color: cleanText(fieldValue(row, "color")) || "—",
+    dieCutPlate: cleanText(fieldValue(row, "dieCutPlate")) || "—",
+    printingPlate: cleanText(fieldValue(row, "printingPlate")) || "—",
     processRequirement: cleanText(fieldValue(row, "processRequirement")) || "—",
     processRemark: cleanText(fieldValue(row, "processRemark")) || "—",
     productionRequirement: cleanText(fieldValue(row, "productionRequirement")) || "—"
@@ -507,29 +512,70 @@ function defaultScheduleStartValue() {
   return `${date.getFullYear()}-${padTimePart(date.getMonth() + 1)}-${padTimePart(date.getDate())}T08:00`;
 }
 
-function sortForSchedule(rows) {
-  return rows.slice().sort((a, b) => {
-    const parsedDateA = a.deliveryDate && a.deliveryDate !== "—" ? new Date(a.deliveryDate).getTime() : NaN;
-    const parsedDateB = b.deliveryDate && b.deliveryDate !== "—" ? new Date(b.deliveryDate).getTime() : NaN;
-    const dateA = Number.isFinite(parsedDateA) ? parsedDateA : Number.MAX_SAFE_INTEGER;
-    const dateB = Number.isFinite(parsedDateB) ? parsedDateB : Number.MAX_SAFE_INTEGER;
-    const colorA = a.color && a.color !== "—" ? a.color : "\uffff";
-    const colorB = b.color && b.color !== "—" ? b.color : "\uffff";
-    const sizeA = a.productionSize && a.productionSize !== "—" ? a.productionSize : "\uffff";
-    const sizeB = b.productionSize && b.productionSize !== "—" ? b.productionSize : "\uffff";
-    return dateA - dateB
-      || colorA.localeCompare(colorB, "zh-CN", { numeric: true, sensitivity: "base" })
-      || sizeA.localeCompare(sizeB, "zh-CN", { numeric: true, sensitivity: "base" })
-      || a.sequence - b.sequence;
-  });
+function isBlankValue(value) {
+  return value == null || value === "" || value === "—";
 }
 
+// 文本相同的排在一起；空值排最后。
+function compareSameText(a, b) {
+  const blankA = isBlankValue(a);
+  const blankB = isBlankValue(b);
+  if (blankA || blankB) return blankA === blankB ? 0 : blankA ? 1 : -1;
+  return String(a).localeCompare(String(b), "zh-CN", { numeric: true, sensitivity: "base" });
+}
+
+// 交期按“天”比较（同一天视为相同，继续按后面的条件排）；无交期排最后。
+function deliveryDay(value) {
+  const matched = String(value || "").match(/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/);
+  return matched ? Date.UTC(Number(matched[1]), Number(matched[2]) - 1, Number(matched[3])) : Number.MAX_SAFE_INTEGER;
+}
+
+// 尺寸相近：按尺寸里的数字（长、宽、高…）依次从小到大比较，数值接近的会相邻；无尺寸排最后。
+function compareSize(a, b) {
+  const partsA = isBlankValue(a) ? [] : (String(a).match(/\d+(?:\.\d+)?/g) || []).map(Number);
+  const partsB = isBlankValue(b) ? [] : (String(b).match(/\d+(?:\.\d+)?/g) || []).map(Number);
+  if (!partsA.length || !partsB.length) return (partsA.length ? 0 : 1) - (partsB.length ? 0 : 1);
+  for (let index = 0; index < Math.max(partsA.length, partsB.length); index += 1) {
+    const diff = (partsA[index] ?? 0) - (partsB[index] ?? 0);
+    if (diff) return diff;
+  }
+  return 0;
+}
+
+// 自动排序规则（按优先级）：
+// 1. 机床：同一实际机床的任务排在一起（机床按机床序号、名称排列）
+// 2. 交期：早的在前
+// 3. 产品名称：相同产品排在一起
+// 4. 尺寸：相近的排在一起
+// 5. 工艺中的颜色、模切版、印刷版：相同的排在一起
+function sortForSchedule(rows) {
+  const machineRank = new Map();
+  rows.forEach((row) => {
+    const sequence = Number.isFinite(Number(row.machineSequence)) ? Number(row.machineSequence) : 999999;
+    machineRank.set(row.machine, Math.min(machineRank.has(row.machine) ? machineRank.get(row.machine) : 999999, sequence));
+  });
+  return rows.slice().sort((a, b) =>
+    machineRank.get(a.machine) - machineRank.get(b.machine)
+    || compareSameText(a.machine, b.machine)
+    || deliveryDay(a.deliveryDate) - deliveryDay(b.deliveryDate)
+    || compareSameText(a.productName, b.productName)
+    || compareSize(a.productionSize, b.productionSize)
+    || compareSameText(a.color, b.color)
+    || compareSameText(a.dieCutPlate, b.dieCutPlate)
+    || compareSameText(a.printingPlate, b.printingPlate)
+    || a.sequence - b.sequence
+  );
+}
+
+// 排程时间：同一张机床卡片是一台设备的一条连续时间线——从开始时间（默认次日 08:00）起，
+// 第一条开始，后一条接着前一条的结束时间，不因“机床”列不同而重新从 8 点算。
+// 合并卡片（大五色印刷 / 联动线）整张卡片连续计算；“全部机床”时每张卡片各自从开始时间算。
 function calculateTimedSchedule(rows, startValue) {
   const startTime = new Date(startValue);
   if (Number.isNaN(startTime.getTime())) throw new Error("请输入有效的排程开始时间");
   const groups = new Map();
   rows.forEach((row) => {
-    const key = `${row.process}::${row.machine}`;
+    const key = machineCardKey(row);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   });
@@ -1787,7 +1833,7 @@ export default function App() {
         || previous.scheduleStartTime !== row.scheduleStartTime
         || previous.scheduleEndTime !== row.scheduleEndTime);
     });
-    if (!quiet) setNotice(`已按日期、颜色、尺寸自动排序，并从 ${formatScheduleTime(startTimeValue)} 计算排程时间${missingRateCount ? `；${missingRateCount} 条缺少张/分钟，仅计换版时间` : ""}`);
+    if (!quiet) setNotice(`已按机床、交期、产品名称、尺寸、颜色/版型自动排序，从 ${formatScheduleTime(startTimeValue)} 起连续计算排程时间${missingRateCount ? `；${missingRateCount} 条缺少张/分钟，仅计换版时间` : ""}`);
     if (!changed.length) return Promise.resolve(true);
     const optimistic = applyOptimistic(new Map(changed.map((row) => [row.rowid, {
       sequence: row.sequence, scheduleStartTime: row.scheduleStartTime, scheduleEndTime: row.scheduleEndTime

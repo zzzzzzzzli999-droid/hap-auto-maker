@@ -29,14 +29,20 @@
     { controlId: "c_remark", controlName: "工艺备注", type: 2 },
     { controlId: "c_start", controlName: "开始时间", type: 2 },
     { controlId: "c_end", controlName: "结束时间", type: 2 },
-    { controlId: "c_rate", controlName: "张/分钟", type: 6 }
+    { controlId: "c_rate", controlName: "张/分钟", type: 6 },
+    { controlId: "c_date", controlName: "生产交期", type: 15 },
+    { controlId: "c_color", controlName: "颜色", type: 2 },
+    { controlId: "c_die", controlName: "模切版", type: 2 },
+    { controlId: "c_print", controlName: "印刷版", type: 2 }
   ];
   window.env = {
     process: "c_process", machine: "c_machine", machineSequence: "c_mseq", scheduleStatus: "c_status",
     scheduleSequence: "c_seq", scheduleQuantity: "c_qty", preSplitScheduleQuantity: "c_pre", qualifiedQuantity: "c_ok",
     customer: "c_customer", orderNo: "c_order", productCode: "c_code", productName: "c_name", productionSize: "c_size",
     requiredQuantity: "c_req", productionQuantity: "c_prod", processRemark: "c_remark",
-    scheduleStartTime: "c_start", scheduleEndTime: "c_end", sheetsPerMinute: "c_rate"
+    scheduleStartTime: "c_start", scheduleEndTime: "c_end", sheetsPerMinute: "c_rate",
+    deliveryDate: "c_date", color: "c_color"
+    // 模切版 / 印刷版 故意不映射：验证按字段名自动识别
   };
   window.config = { appId: "app1", worksheetId: "ws1", viewId: "view1", accountId: "acc1", controls };
 
@@ -66,8 +72,10 @@
         rowid, c_process: process, c_machine: machine, c_mseq: String(mseq),
         c_status: JSON.stringify([status]), c_seq: String(seq), c_qty: String(qty), c_pre: String(qty), c_ok: "0",
         c_customer: CUSTOMERS[id % CUSTOMERS.length], c_order: `X2609${String(10000 + id)}`, c_code: `A${100 + id % 400}-${String(id).padStart(3, "0")}A`,
-        c_name: `${["320g大青盐加碘纸箱", "2.25kg餐饮原味", "160g番茄火锅", "周转箱"][id % 4]}${id}`, c_size: `${400 + id % 90}*330*180`,
-        c_req: String(qty), c_prod: String(qty), c_remark: "", c_start: "", c_end: "", c_rate: String(60 + id % 40)
+        c_name: ["320g大青盐加碘纸箱", "2.25kg餐饮原味", "160g番茄火锅", "周转箱", "300g精制湖盐"][id % 5], c_size: `${400 + (id * 7) % 60}*${300 + id % 3 * 10}*180`,
+        c_req: String(qty), c_prod: String(qty), c_remark: "", c_start: "", c_end: "", c_rate: String(60 + id % 40),
+        c_date: `2026-10-${String(10 + id % 4).padStart(2, "0")}${id % 7 === 0 ? " 15:30" : ""}`, c_color: ["红", "蓝", "黑", "四色"][id % 4],
+        c_die: `D${id % 3}`, c_print: `P${id % 2}`
       });
     };
     for (let s = 0; s < queued * ROW_SCALE; s += 1) make("k_queued", 0);

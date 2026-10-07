@@ -294,6 +294,55 @@ async function waitIdle(page, timeout = 20000) {
   check("页面无脚本错误", page.__errors.length === 0, page.__errors.join(" | "));
   await page.close();
 
+  // ---------- 5. 自动排序规则 ----------
+  page = await open(browser);
+  // 在“联动线”合并卡片上点左侧“自动排序”
+  await page.click(".unscheduled-board .board-tools button:not(.select-visible)");
+  const sortNotice = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
+  check("自动排序提示新规则", /机床、交期、产品名称、尺寸、颜色\/版型/.test(sortNotice) && /08:00/.test(sortNotice), sortNotice);
+  await waitIdle(page);
+  const sortResult = await page.evaluate(() => {
+    const family = Array.from(window.__mock.store.values()).filter((row) => row.c_machine.includes("联动线") && row.c_status.includes("k_queued"));
+    // 独立实现一遍期望规则：机床(机床序号) → 交期(天) → 产品名称 → 尺寸数值 → 颜色 → 模切版 → 印刷版
+    const day = (v) => { const m = String(v).match(/(\d{4})-(\d{1,2})-(\d{1,2})/); return m ? Date.UTC(+m[1], m[2] - 1, +m[3]) : Infinity; };
+    const nums = (v) => String(v).match(/\d+/g).map(Number);
+    const text = (a, b) => a.localeCompare(b, "zh-CN", { numeric: true, sensitivity: "base" });
+    const expected = family.slice().sort((a, b) => (+a.c_mseq - +b.c_mseq) || text(a.c_machine, b.c_machine) || day(a.c_date) - day(b.c_date) || text(a.c_name, b.c_name)
+      || (() => { const x = nums(a.c_size), y = nums(b.c_size); for (let i = 0; i < 3; i += 1) if (x[i] !== y[i]) return x[i] - y[i]; return 0; })()
+      || text(a.c_color, b.c_color) || text(a.c_die, b.c_die) || text(a.c_print, b.c_print));
+    const actual = family.slice().sort((a, b) => Number(a.c_seq) - Number(b.c_seq));
+    const parse = (v) => new Date(v.replace(" ", "T")).getTime();
+    let continuous = true; let durationsOk = true;
+    actual.forEach((row, i) => {
+      const minutes = (parse(row.c_end) - parse(row.c_start)) / 60000;
+      if (minutes !== Math.ceil(Number(row.c_qty) / Number(row.c_rate))) durationsOk = false;
+      if (i > 0 && row.c_start !== actual[i - 1].c_end) continuous = false;
+    });
+    const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+    const pad = (n) => String(n).padStart(2, "0");
+    const expectedStart = `${tomorrow.getFullYear()}-${pad(tomorrow.getMonth() + 1)}-${pad(tomorrow.getDate())} 08:00`;
+    const machineRuns = actual.map((row) => row.c_machine).filter((m, i, list) => i === 0 || list[i - 1] !== m);
+    return {
+      count: actual.length,
+      seqOk: actual.every((row, i) => Number(row.c_seq) === i + 1),
+      orderOk: expected.every((row, i) => row.rowid === actual[i].rowid),
+      firstMismatch: expected.findIndex((row, i) => row.rowid !== actual[i].rowid),
+      machineRuns,
+      firstStart: actual[0].c_start, expectedStart, continuous, durationsOk,
+      lastEnd: actual[actual.length - 1].c_end,
+      sample: actual.slice(0, 6).map((r) => `${r.c_seq}.${r.c_machine}|${r.c_date}|${r.c_name}|${r.c_size}|${r.c_color}|${r.c_die}|${r.c_print}|${r.c_start}-${r.c_end.slice(11)}`)
+    };
+  });
+  console.log("  " + sortResult.sample.join("\n  "));
+  check("排序顺序完全符合 机床→交期→产品名称→尺寸→颜色/模切版/印刷版", sortResult.orderOk && sortResult.seqOk, `${sortResult.count} 条${sortResult.orderOk ? "" : `，第 ${sortResult.firstMismatch + 1} 条不符`}`);
+  check("同一机床的任务连在一起（每种机床只出现一段）", new Set(sortResult.machineRuns).size === sortResult.machineRuns.length, sortResult.machineRuns.join(" → "));
+  check("第一条从次日 08:00 开始", sortResult.firstStart === sortResult.expectedStart, sortResult.firstStart);
+  check("整张卡片一条连续时间线（不按机床重新从 8 点算）", sortResult.continuous, `结束于 ${sortResult.lastEnd}`);
+  check("每条时长 = 排程量 ÷ 张/分钟", sortResult.durationsOk);
+  const plateRead = await page.evaluate(() => window.__mock.calls.some(() => true));
+  check("页面无脚本错误（自动排序）", page.__errors.length === 0, page.__errors.join(" | "));
+  await page.close();
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} passed`);
   await browser.close();
