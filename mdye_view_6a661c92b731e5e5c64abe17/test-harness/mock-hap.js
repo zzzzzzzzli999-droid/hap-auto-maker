@@ -83,7 +83,7 @@
   });
 
   const calls = [];
-  window.__mock = { store, calls, failNext: 0, latency: LATENCY, inflight: 0 };
+  window.__mock = { store, calls, failNext: 0, failDeleteNext: 0, latency: LATENCY, inflight: 0 };
   const delay = (value) => new Promise((resolve, reject) => {
     window.__mock.inflight += 1;
     setTimeout(() => {
@@ -107,7 +107,11 @@
       data.newOldControl.forEach((control) => { row[control.controlId] = control.value; });
       return { data: { ...row }, resultCode: 1 };
     }
-    if (action === "deleteWorksheetRows") { data.rowIds.forEach((rowId) => store.delete(rowId)); return { data: true }; }
+    if (action === "deleteWorksheetRows") {
+      if (window.__mock.failDeleteNext > 0) { window.__mock.failDeleteNext -= 1; return new Error("模拟删除失败"); }
+      data.rowIds.forEach((rowId) => store.delete(rowId));
+      return { data: true };
+    }
     if (action === "startProcess") {
       if (data.triggerId === "b_split") {
         const source = store.get(data.sources[0]);

@@ -85,7 +85,7 @@ async function waitIdle(page, timeout = 20000) {
   let machines = await columnValues(page, "unscheduled-board", "机床");
   const lianMembers = new Set(["联动线印刷+开槽", "联动线印刷+圆模", "联动线无印刷+开槽", "联动线开槽"]);
   check("联动线明细显示实际机床名", machines && machines.length > 0 && machines.every((m) => lianMembers.has(m)), machines && Array.from(new Set(machines)).join("、"));
-  await page.click(".unscheduled-board .list-head .filter-header:first-of-type .filter-trigger");
+  await page.locator(".unscheduled-board .list-head .filter-header .filter-trigger").first().click();
   const lianOptions = await page.$$eval(".filter-panel .filter-options label span", (els) => els.map((el) => el.textContent));
   check("联动线明细包含 4 种实际机床（机床列筛选项）", lianOptions.length === 4 && lianOptions.every((o) => lianMembers.has(o)), lianOptions.join("、"));
   await page.click(".filter-panel-footer button");
@@ -98,7 +98,7 @@ async function waitIdle(page, timeout = 20000) {
   check("合并卡片不显示“合并机床”按钮（避免误改机床）", !mergeBtnFamily);
 
   // 机床列筛选可用
-  await page.click(".unscheduled-board .list-head .filter-header:first-of-type .filter-trigger");
+  await page.locator(".unscheduled-board .list-head .filter-header .filter-trigger").first().click();
   const options = await page.$$eval(".filter-panel .filter-options label span", (els) => els.map((el) => el.textContent));
   check("“机床”列可筛选（选项为 3 种机床）", options.length === 3 && options.every((o) => daMembers.has(o)), options.join("、"));
   await page.keyboard.press("Escape");
@@ -385,6 +385,135 @@ async function waitIdle(page, timeout = 20000) {
   const backToHidden = await layout();
   check("与双击隐藏互不干扰（隐藏左栏时全屏右栏，还原后仍是隐藏左栏）", maxWhileHidden.right && !maxWhileHidden.cards && !backToHidden.left && backToHidden.right && backToHidden.cards, JSON.stringify({ hiddenThenMax: Boolean(maxWhileHidden.right), back: { left: Boolean(backToHidden.left), right: Boolean(backToHidden.right) } }));
   check("页面无脚本错误（全屏）", page.__errors.length === 0, page.__errors.join(" | "));
+  await page.close();
+
+  // ---------- 7. 勾选 + 多条一起拖 ----------
+  page = await open(browser);
+  await clickCard(page, "大五色印刷");
+  const checkboxInfo = await page.evaluate(() => ({
+    rowBoxes: document.querySelectorAll(".unscheduled-board .schedule-row .check-cell input[type=checkbox]").length,
+    rows: document.querySelectorAll(".unscheduled-board .schedule-row").length,
+    headerBox: Boolean(document.querySelector(".unscheduled-board .list-head .select-header input[type=checkbox]")),
+    headerMenu: Boolean(document.querySelector(".unscheduled-board .list-head .select-menu-trigger")),
+    firstColumn: document.querySelector(".unscheduled-board .schedule-row").children[0].classList.contains("check-cell")
+  }));
+  check("每行第一列是勾选框，表头有勾选框和 ▼ 菜单", checkboxInfo.rowBoxes === checkboxInfo.rows && checkboxInfo.rows > 0 && checkboxInfo.headerBox && checkboxInfo.headerMenu && checkboxInfo.firstColumn, JSON.stringify(checkboxInfo));
+  const queuedRows = page.locator(".unscheduled-board .schedule-row");
+  const ordersQ = await columnValues(page, "unscheduled-board", "生产单号");
+  for (const index of [1, 3, 5]) await queuedRows.nth(index).locator(".check-cell input").check();
+  const chip = async (board) => page.$eval(`.${board} .selected-count`, (el) => el.textContent).catch(() => "");
+  check("勾选 3 行后标题显示“已勾选 3”", (await chip("unscheduled-board")) === "已勾选 3", await chip("unscheduled-board"));
+  check("部分勾选时表头为半选状态", await page.$eval(".unscheduled-board .select-header input", (el) => el.indeterminate && !el.checked));
+  await queuedRows.nth(7).locator("td, .data-cell").first().click();
+  await page.waitForTimeout(300);
+  check("单击行空白处也能勾选，且不会清掉其他勾选", (await chip("unscheduled-board")) === "已勾选 4", await chip("unscheduled-board"));
+  await queuedRows.nth(7).locator(".check-cell input").uncheck();
+  check("再点勾选框取消勾选", (await chip("unscheduled-board")) === "已勾选 3", await chip("unscheduled-board"));
+  await queuedRows.nth(9).dblclick();
+  await page.waitForTimeout(300);
+  check("双击行（打开详情）不改变勾选", (await chip("unscheduled-board")) === "已勾选 3", await chip("unscheduled-board"));
+
+  const pickedOrders = [ordersQ[1], ordersQ[3], ordersQ[5]];
+  await page.evaluate(() => { window.__dropAt = 0; window.__shownAt = 0; const board = document.querySelector(".scheduled-board"); board.addEventListener("drop", () => { window.__dropAt = performance.now(); const poll = () => { if (board.querySelectorAll(".schedule-row").length >= 3) window.__shownAt = performance.now(); else requestAnimationFrame(poll); }; requestAnimationFrame(poll); }, { capture: true, once: true }); });
+  await queuedRows.nth(3).dragTo(page.locator(".scheduled-board .card-list"));
+  await page.waitForFunction(() => window.__shownAt > 0, null, { timeout: 5000 });
+  const multiDropMs = await page.evaluate(() => window.__shownAt - window.__dropAt);
+  const scheduledOrders = await columnValues(page, "scheduled-board", "生产单号");
+  check("拖动其中一条，3 条勾选的行一起到已排程（按原顺序）", JSON.stringify(scheduledOrders) === JSON.stringify(pickedOrders), `${scheduledOrders.join(", ")}；${multiDropMs.toFixed(1)}ms`);
+  check("拖完后这 3 行取消勾选", !(await chip("unscheduled-board")) && !(await chip("scheduled-board")));
+  const leftAfter = await columnValues(page, "unscheduled-board", "生产单号");
+  check("未勾选的行留在未排程", pickedOrders.every((o) => !leftAfter.includes(o)) && leftAfter.length === ordersQ.length - 3, `${ordersQ.length} → ${leftAfter.length}`);
+  await waitIdle(page);
+  const storedPicked = await page.evaluate((orders) => orders.map((o) => { const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o); return `${r.c_status}|${r.c_machine}`; }), pickedOrders);
+  check("3 条都已保存为已排程，机床不变", storedPicked.every((v) => v.startsWith(JSON.stringify(["k_scheduled"]))), storedPicked.join(" ; "));
+
+  // 表头菜单：全选 → 拖回未排程
+  await page.click(".scheduled-board .select-menu-trigger");
+  const menuItems = await page.$$eval(".scheduled-board .select-menu button", (els) => els.map((el) => el.textContent));
+  check("表头 ▼ 菜单有“全选”“全不选”", JSON.stringify(menuItems) === JSON.stringify(["全选", "全不选"]), menuItems.join("/"));
+  await page.click(".scheduled-board .select-menu button:text-is('全选')");
+  check("菜单全选后已排程全部勾选", (await chip("scheduled-board")) === "已勾选 3" && await page.$eval(".scheduled-board .select-header input", (el) => el.checked));
+  await page.click(".scheduled-board .select-menu-trigger");
+  await page.click(".scheduled-board .select-menu button:text-is('全不选')");
+  check("菜单全不选后取消全部勾选", !(await chip("scheduled-board")));
+  await page.click(".scheduled-board .select-header input");
+  check("点表头勾选框也能全选", (await chip("scheduled-board")) === "已勾选 3");
+  await page.locator(".scheduled-board .schedule-row").first().dragTo(page.locator(".unscheduled-board .card-list"));
+  await page.waitForTimeout(120);
+  const backLeft = await columnValues(page, "unscheduled-board", "生产单号");
+  check("勾选的已排程行一起拖回未排程", (await page.$$(".scheduled-board .schedule-row")).length === 0 && pickedOrders.every((o) => backLeft.includes(o)), `右侧剩 ${(await page.$$(".scheduled-board .schedule-row")).length} 条`);
+  await waitIdle(page);
+
+  // 有勾选时拖一条未勾选的行：只拖这一行，其他勾选保留
+  const rowsNow = page.locator(".unscheduled-board .schedule-row");
+  await rowsNow.nth(0).locator(".check-cell input").check();
+  await rowsNow.nth(2).locator(".check-cell input").check();
+  const loneOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[4];
+  await rowsNow.nth(4).dragTo(page.locator(".scheduled-board .card-list"));
+  await page.waitForTimeout(120);
+  const rightNow = await columnValues(page, "scheduled-board", "生产单号");
+  check("拖动未勾选的行时只拖这一行，其他勾选保留", JSON.stringify(rightNow) === JSON.stringify([loneOrder]) && (await chip("unscheduled-board")) === "已勾选 2", `右侧：${rightNow.join(",")}；${await chip("unscheduled-board")}`);
+  await waitIdle(page);
+  check("页面无脚本错误（勾选）", page.__errors.length === 0, page.__errors.join(" | "));
+  await page.screenshot({ path: path.join(__dirname, "shot-check.png") });
+  await page.close();
+
+  // ---------- 8. 合并分拆：本记录排程量 + 被合并记录排程量 ----------
+  page = await open(browser);
+  await clickCard(page, "上油");
+  const splitAndWait = async (index, cut) => {
+    const row = page.locator(".unscheduled-board .schedule-row").nth(index);
+    const order = (await columnValues(page, "unscheduled-board", "生产单号"))[index];
+    const qty = Number(await row.locator(".quantity-cell input").inputValue());
+    await row.locator(".split-icon").click();
+    await page.fill(".split-modal input", String(qty - cut));
+    await page.click(".split-modal .primary");
+    await waitIdle(page);
+    await page.waitForFunction(() => !document.querySelector(".pending-row"), null, { timeout: 10000 });
+    return { order, qty };
+  };
+  const first = await splitAndWait(0, 100);
+  const storeRows = (order) => page.evaluate((o) => Array.from(window.__mock.store.values()).filter((r) => r.c_order === o).map((r) => ({ id: r.rowid, qty: Number(r.c_qty), pre: Number(r.c_pre) })), order);
+  let pieces = await storeRows(first.order);
+  check("分拆后同一生产单号有 2 条记录（保留量 + 拆出 100）", pieces.length === 2 && pieces.some((p) => p.qty === first.qty - 100) && pieces.some((p) => p.qty === 100), JSON.stringify(pieces));
+  const sourceIndex = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(first.order);
+  const sourceRow = page.locator(".unscheduled-board .schedule-row").nth(sourceIndex);
+  check("原记录出现“合并”按钮", await sourceRow.locator(".merge-icon").count() === 1);
+  const callsBeforeMerge = await page.evaluate(() => window.__mock.calls.length);
+  await sourceRow.locator(".merge-icon").click();
+  await page.waitForSelector(".merge-modal");
+  const mergeDialog = await page.evaluate(() => ({
+    items: Array.from(document.querySelectorAll(".merge-modal .merge-item")).map((el) => ({ checked: el.querySelector("input").checked, qty: el.querySelector("b").textContent })),
+    hint: document.querySelector(".merge-modal .split-hint").textContent
+  }));
+  check("合并弹窗列出拆出的记录并默认勾选", mergeDialog.items.length === 1 && mergeDialog.items[0].checked && mergeDialog.items[0].qty === "100", JSON.stringify(mergeDialog.items));
+  check("弹窗显示合并后排程量 = 本记录 + 被合并记录", mergeDialog.hint.includes(`${first.qty - 100} + 100 = ${first.qty}`), mergeDialog.hint);
+  await page.click(".merge-modal .primary");
+  await page.waitForTimeout(80);
+  const afterMergeUi = await page.evaluate((order) => {
+    const headers = Array.from(document.querySelectorAll(".unscheduled-board .list-head > *")).map((el) => el.textContent.replace(/[▼⋮]/g, "").trim());
+    const orderIndex = headers.indexOf("生产单号");
+    return Array.from(document.querySelectorAll(".unscheduled-board .schedule-row")).filter((row) => row.children[orderIndex]?.textContent.trim() === order).map((row) => ({ qty: row.querySelector(".quantity-cell input").value, merge: Boolean(row.querySelector(".merge-icon")) }));
+  }, first.order);
+  check("确认后立即：只剩 1 条，排程量为两者之和，合并按钮消失", afterMergeUi.length === 1 && afterMergeUi[0].qty === String(first.qty) && !afterMergeUi[0].merge, JSON.stringify(afterMergeUi));
+  await waitIdle(page);
+  pieces = await storeRows(first.order);
+  check("已保存到明道云：本记录排程量 = 原保留量 + 100，被合并记录已删除", pieces.length === 1 && pieces[0].qty === first.qty, JSON.stringify(pieces));
+  const mergeCalls = await page.evaluate((n) => window.__mock.calls.slice(n).map((c) => c.action + (c.data.triggerId ? `:${c.data.triggerId}` : "")), callsBeforeMerge);
+  check("不再调用明道云“合并”工作流", !mergeCalls.some((c) => c.includes("b_merge")) && mergeCalls.includes("deleteWorksheetRows"), mergeCalls.filter((c) => c !== "getFilterRows" && c !== "getWorksheetControls").join(", "));
+
+  // 删除失败 → 排程量自动改回，记录恢复
+  const second = await splitAndWait(1, 50);
+  const secondIndex = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(second.order);
+  await page.evaluate(() => { window.__mock.failDeleteNext = 1; });
+  await page.locator(".unscheduled-board .schedule-row").nth(secondIndex).locator(".merge-icon").click();
+  await page.click(".merge-modal .primary");
+  await waitIdle(page);
+  pieces = await storeRows(second.order);
+  const failNotice = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
+  const uiCount = (await columnValues(page, "unscheduled-board", "生产单号")).filter((o) => o === second.order).length;
+  check("删除失败时排程量自动改回、两条记录都恢复并提示", pieces.length === 2 && pieces.some((p) => p.qty === second.qty - 50) && pieces.some((p) => p.qty === 50) && uiCount === 2 && /已恢复/.test(failNotice), `${JSON.stringify(pieces)}；界面 ${uiCount} 条；${failNotice}`);
+  check("页面无脚本错误（合并）", page.__errors.length === 0, page.__errors.join(" | "));
   await page.close();
 
   const failed = results.filter((r) => !r.ok);

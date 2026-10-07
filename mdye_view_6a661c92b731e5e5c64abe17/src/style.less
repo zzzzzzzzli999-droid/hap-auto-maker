@@ -167,6 +167,18 @@ button { color: inherit; }
 .magnify-cell { width: 21px; height: 21px; flex: 0 0 21px; display: grid; place-items: center; padding: 0; color: #2478b2; background: #e5f3fb; border: 1px solid #99c1d9; border-radius: 2px; cursor: zoom-in; font-size: 15px; line-height: 1; }
 .magnify-cell:hover { color: #fff; background: #2b86c5; border-color: #1d72aa; }
 .drag-grip { flex: 0 0 auto; color: #b1b7bf; font-size: 19px; line-height: 1; }
+/* 勾选列：行勾选框 + 表头（全选/全不选菜单）；勾选的行可一起拖动 */
+.schedule-row > .check-cell { height: 100%; display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer; }
+.check-cell input, .select-header input { width: 15px; height: 15px; margin: 0; accent-color: #2b83c2; cursor: pointer; }
+.check-cell input:disabled, .select-header input:disabled { cursor: not-allowed; opacity: .45; }
+.list-head > .select-header { position: relative; height: 100%; display: flex; align-items: center; justify-content: center; gap: 2px; overflow: visible; padding: 0; }
+.select-menu-trigger { width: 11px; padding: 0; color: #7998ad; background: transparent; border: 0; cursor: pointer; font-size: 8px; line-height: 1; }
+.select-menu-trigger:disabled { cursor: not-allowed; opacity: .45; }
+.select-header.open .select-menu-trigger { color: #1678b8; }
+.select-menu { position: absolute; top: calc(100% + 1px); left: 0; z-index: 100; min-width: 96px; display: grid; padding: 4px; background: #fff; border: 1px solid #89b4cf; border-radius: 3px; box-shadow: 0 12px 28px rgba(23,63,93,.22); }
+.select-menu button { height: 30px; padding: 0 14px; color: #244b65; background: transparent; border: 0; border-radius: 2px; cursor: pointer; text-align: left; white-space: nowrap; font-size: 13px; }
+.select-menu button:hover, .select-menu button:focus-visible { color: #0c4675; background: #e3f2fa; outline: none; }
+.board-head em.selected-count { min-width: 0; color: #fff; background: #2b83c2; }
 .order-cell { color: #9aa2ac; text-align: center; font-size: 11px; }
 .sequence { width: 18px; height: 24px; display: inline-grid; place-items: center; color: #fff; background: #438fd0; border-radius: 2px; font-size: 10px; font-weight: 800; box-shadow: none; }
 .title-cell { color: #174766; font-size: 11px; font-weight: 700; }
@@ -228,6 +240,17 @@ footer { flex: none; height: 22px; display: flex; align-items: flex-end; justify
 .split-modal select:focus { border-color: #2d86c3; box-shadow: 0 0 0 2px rgba(45,134,195,.12); }
 .split-hint { margin: 10px 0 0; padding: 9px 10px; color: #58778d; background: #eef7fc; border-radius: 3px; font-size: 11px; line-height: 1.6; }
 .split-hint strong { color: #c47324; }
+/* 合并分拆弹窗：列出同一生产单号、产品的其他记录，勾选后求和 */
+.split-modal.merge-modal { width: 460px; }
+.merge-list { max-height: 240px; margin-top: 4px; overflow: auto; border: 1px solid #d4e5ef; border-radius: 3px; }
+.merge-list-head, .split-modal label.merge-item { display: grid; grid-template-columns: 28px minmax(0, 1fr) 72px; align-items: center; gap: 6px; padding: 0 10px; }
+.merge-list-head { height: 28px; color: #6f8da2; background: #eef7fc; font-size: 11px; }
+.merge-list-head span:last-child, .merge-item b { text-align: right; font-variant-numeric: tabular-nums; }
+.split-modal label.merge-item { min-height: 34px; justify-content: stretch; border-top: 1px solid #e6eff5; cursor: pointer; }
+.split-modal label.merge-item:hover { background: #f2f9fd; }
+.split-modal .merge-item input { width: 15px; height: 15px; margin: 0; accent-color: #2b83c2; }
+.merge-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.merge-item b { color: #1978b9; }
 .danger-text { padding: 10px; color: #914040; background: #fff1f1; border: 1px solid #f0cccc; border-radius: 3px; font-size: 12px; }
 .modal-actions .danger.primary { color: #fff; background: #c95555; border-color: #ad3d3d; }
 .detail-modal { width: min(720px, calc(100vw - 40px)); max-height: min(620px, calc(100vh - 40px)); padding: 20px; color: #214e6c; background: #fff; border: 1px solid #8fbad3; border-radius: 5px; box-shadow: 0 18px 50px rgba(20,55,80,.24); }
