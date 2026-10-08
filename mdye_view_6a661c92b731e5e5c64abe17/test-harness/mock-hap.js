@@ -16,6 +16,8 @@
   const NO_SUMMARY = params.get("nosummary") === "1";
   // splitmachine=打包：模拟“分拆”工作流把新记录建在别的机床上（插件应改回原记录的机床）
   const SPLIT_MACHINE = params.get("splitmachine") || "";
+  // nosplitbtn=1：插件视图里没有“分拆”自定义按钮（用户实际情况：“当前视图未找到‘分拆’自定义按钮”）
+  const NO_SPLIT_BUTTON = params.get("nosplitbtn") === "1";
   const summarySid = (no) => machineSid(`汇总:${no}`);
   const summaryValue = (no) => no ? JSON.stringify([{ sid: summarySid(no), name: no, sourcevalue: JSON.stringify({ rowid: summarySid(no), s_no: no }) }]) : "";
   const machineValue = (name) => RELATION_MACHINE ? JSON.stringify([{ sid: machineSid(name), name, sourcevalue: JSON.stringify({ rowid: machineSid(name), m_name: name }), row: { rowid: machineSid(name) } }]) : name;
@@ -118,7 +120,8 @@
     rejectNext: [],         // updateWorksheetRow 依次返回 { data: null, resultCode, badData }
     ignoreNext: 0,          // updateWorksheetRow 返回成功（resultCode 1），但记录什么都没改
     deleteRejectNext: 0,    // deleteWorksheetRows 返回 { isSuccess: false }
-    processRejectNext: 0    // startProcess 返回 false（记录不满足执行条件或流程尚未启用）
+    processRejectNext: 0,   // startProcess 返回 false（记录不满足执行条件或流程尚未启用）
+    addRejectNext: []       // addWorksheetRow 依次返回 { data: null, resultCode }
   };
   // 表单业务规则（resultCode 32 时插件读取规则里的提示文字）
   const RULES = [{ ruleId: "rule_lock", name: "已排程锁定机床", ruleItems: [{ type: 6, message: "已排程的任务不允许更换机床", controls: [{ controlId: "c_machine" }] }] }];
@@ -144,7 +147,7 @@
       return { data: items.map((item) => ({ rowid: item.sid, s_no: item.name })), count: items.length, resultCode: 1 };
     }
     if (action === "getWorksheetControls") return { data: { controls }, resultCode: 1 };
-    if (action === "getWorksheetBtns") return [{ btnId: "b_split", name: "分拆" }, { btnId: "b_merge", name: "合并" }, { btnId: "b_confirm", name: "确定排程" }];
+    if (action === "getWorksheetBtns") return [...(NO_SPLIT_BUTTON ? [] : [{ btnId: "b_split", name: "分拆" }]), { btnId: "b_merge", name: "合并" }, { btnId: "b_confirm", name: "确定排程" }];
     if (action === "getControlRules") return RULES;
     if (window.__mock.failNext > 0 && (action === "updateWorksheetRow" || action === "startProcess")) {
       window.__mock.failNext -= 1;
@@ -184,6 +187,27 @@
       });
       return { data: { ...row }, resultCode: 1 };
     }
+    if (action === "addWorksheetRow") {
+      if (window.__mock.addRejectNext.length) { const reject = window.__mock.addRejectNext.shift(); return { data: null, resultCode: reject.resultCode }; }
+      const known = new Set(controls.map((control) => control.controlId));
+      const bad = (data.receiveControls || []).find((control) => !known.has(control.controlId) || typeof control.value !== "string");
+      if (bad) return exception(`字段“${bad.controlName || bad.controlId}”的参数格式错误`);
+      id += 1;
+      const rowid = `r${String(id).padStart(4, "0")}`;
+      const row = { rowid, ctime: new Date().toISOString() };
+      for (const control of data.receiveControls) {
+        if (RELATION_MACHINE && control.controlId === "c_machine") {
+          const items = JSON.parse(control.value);
+          if (!Array.isArray(items) || !items.every((item) => isUuid(item.sid) && Object.keys(item).every((key) => ["name", "sid", "sourcevalue"].includes(key)))) return exception("字段“后道机床”的参数格式错误");
+          const name = machineNameBySid(items[0].sid);
+          if (name) row.c_machine = machineValue(name);
+          continue;
+        }
+        row[control.controlId] = control.value;
+      }
+      store.set(rowid, row);
+      return { data: { ...row }, resultCode: 1 };
+    }
     if (action === "deleteWorksheetRows") {
       if (window.__mock.failDeleteNext > 0) { window.__mock.failDeleteNext -= 1; return exception("模拟删除失败"); }
       if (window.__mock.deleteRejectNext > 0) { window.__mock.deleteRejectNext -= 1; return { isSuccess: false }; }
@@ -218,6 +242,7 @@
     getFilterRows: (data) => call("worksheet", "getFilterRows", data),
     updateWorksheetRow: (data) => call("worksheet", "updateWorksheetRow", data),
     deleteWorksheetRow: (data) => call("worksheet", "deleteWorksheetRows", data),
+    addWorksheetRow: (data) => call("worksheet", "addWorksheetRow", data),
     getRowRelationRows: (data) => call("worksheet", "getRowRelationRows", data)
   };
   window.utils = { openRecordInfo: (args) => { window.__mock.opened.push(args); return Promise.resolve(); } };

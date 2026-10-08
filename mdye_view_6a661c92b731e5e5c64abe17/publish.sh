@@ -12,7 +12,6 @@ COMMIT="${1:-claude/mdye-view-directory-dkpgm4}"
 PLUGIN_DIR="${2:-$HOME/Documents/Codex/2026-07-26/mdye_view_6a661c92b731e5e5c64abe17}"
 REPO="zzzzzzzzli999-droid/hap-auto-maker"
 SUBDIR="mdye_view_6a661c92b731e5e5c64abe17"
-MESSAGE="${PUBLISH_MESSAGE:-后道机床排程更新 ${COMMIT:0:7}}"
 
 if [ ! -f "$PLUGIN_DIR/mdye.json" ]; then
   echo "找不到插件目录：$PLUGIN_DIR（里面应该有 mdye.json）"
@@ -46,6 +45,9 @@ if ! cp -R "$src_root/src/." "$PLUGIN_DIR/src/" || ! cp -R "$src_root/.config/."
   exit 1
 fi
 echo "   已覆盖，原文件备份在 $backup"
+version=$(grep -o 'PLUGIN_VERSION = "[^"]*"' "$PLUGIN_DIR/src/App.js" | head -1 | cut -d'"' -f2)
+echo "   本地插件版本：${version:-未知}"
+MESSAGE="${PUBLISH_MESSAGE:-后道机床排程 插件版本 ${version:-未知}（${COMMIT:0:7}）}"
 
 cd "$PLUGIN_DIR" || exit 1
 # 从终端读输入（mdye 未登录时会要求登录）；用 curl ... | bash 运行时标准输入不是终端
@@ -70,4 +72,6 @@ run_mdye "④ 推送新版本到明道（mdye push）…" "push ?成功|push suc
 
 echo ""
 echo "✓ 完成：本地插件已覆盖为 ${COMMIT:0:7}，新版本已推送到明道。"
-echo "  最后一步：明道「插件」→ 后道机床排程 → 提交记录，点最新一条的“发布”，然后刷新页面。"
+echo "  最后一步：明道「插件」→ 后道机床排程 → 提交记录，点最新一条的“发布”，然后刷新页面（Command + Shift + R）。"
+[ -n "$version" ] && echo "  刷新后插件左下角应显示「插件版本 ${version}」；不是这个版本号，说明明道还在用旧版本。"
+exit 0

@@ -55,16 +55,8 @@ button { color: inherit; }
 /* 合并卡片（大五色印刷 / 联动线）：左侧加粗色条，与单机床卡片区分 */
 .machine-tabs button.family-tab { border-left: 4px solid #3f8fcf; padding-left: 7px; }
 .machine-tabs button.family-tab.active { border-left-color: #1f5fa8; }
-.merge-machine-trigger { min-width: 82px; height: 26px; padding: 0 11px; color: #176348; border: 1px solid #73b495; border-radius: 3px; background: #edf9f2; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
-.merge-machine-trigger:hover { color: #fff; background: #27875e; }
-.merge-machine-trigger:disabled { cursor: wait; opacity: .58; }
 /* 更换机床：勾选任务后换到同工序的其他机床 */
-.change-machine-trigger { flex: none; height: 26px; padding: 0 10px; color: #1d5d86; border: 1px solid #8ebbd5; border-radius: 3px; background: #f5fbff; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
-.change-machine-trigger:hover, .change-machine-trigger:focus-visible { color: #fff; background: #2d86c3; border-color: #1d70aa; outline: none; }
 /* 打印排程表：打开已排程明细关联的排程汇总表 */
-.print-schedule-trigger { flex: none; height: 26px; padding: 0 10px; color: #5a3f99; border: 1px solid #b7a3dd; border-radius: 3px; background: #f7f3ff; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
-.print-schedule-trigger:hover, .print-schedule-trigger:focus-visible { color: #fff; background: #7356c2; border-color: #5d43a8; outline: none; }
-.print-schedule-trigger:disabled { cursor: not-allowed; opacity: .5; }
 .split-modal label strong.machine-change-current { max-width: 230px; overflow: hidden; color: #315c78; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .machine-change-orders { margin: -4px 0 4px; overflow: hidden; color: #5d7d93; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .split-modal select.unselected { color: #8aa3b5; }
@@ -100,19 +92,25 @@ button { color: inherit; }
 .board-head em { min-width: 25px; padding: 3px 6px; color: #54768e; background: #d8e9f2; border-radius: 999px; text-align: center; font-size: 10px; font-style: normal; }
 .board-head p { min-width: 0; margin: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: clamp(9px, 1.4cqw, 11px); }
 .board-tools { flex: 1; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
-.board-tools button { flex: 0 0 auto; height: 29px; padding: 0 8px; color: #fff; background: linear-gradient(#3f9ddb, #1978b9); border: 1px solid #176ca4; border-radius: 3px; cursor: pointer; white-space: nowrap; font-size: clamp(9px, 1.4cqw, 11px); font-weight: 700; box-shadow: inset 0 1px rgba(255,255,255,.25); }
-.board-tools button span { margin-right: 5px; font-size: 14px; }
-.board-tools button.select-visible { color: #1d5d86; background: #f5fbff; border-color: #8ebbd5; box-shadow: none; }
-.board-tools button.select-visible:hover { color: #fff; background: #2d86c3; border-color: #1d70aa; }
-.board-tools button:hover { filter: brightness(1.08); box-shadow: 0 0 20px rgba(32,211,255,.25); }
-.board-tools button.confirm-schedule { background: linear-gradient(#42a982, #268263); border-color: #1d7256; }
-.board-tools button.confirm-schedule:hover { box-shadow: 0 0 18px rgba(38, 130, 99, .25); }
-.board-tools button:disabled { cursor: not-allowed; filter: grayscale(.8); opacity: .45; box-shadow: none; }
+/* 栏标题按钮：统一高度、圆角，图标 + 文字。白底（更换机床、打印排程表、合并机床、全选）、蓝色（自动排序）、绿色（确定排程） */
+.board-head .head-btn { flex: none; height: 30px; display: inline-flex; align-items: center; gap: 5px; padding: 0 clamp(7px, 1.1cqw, 11px); border: 1px solid transparent; border-radius: 6px; cursor: pointer; font-size: clamp(11.5px, 1.5cqw, 12.5px); font-weight: 600; line-height: 1; white-space: nowrap; transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease; }
+.board-head .head-btn .btn-icon { width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.board-head .head-btn:active:not(:disabled) { transform: translateY(1px); }
+.board-head .head-btn:focus-visible { outline: 2px solid rgba(45, 134, 195, .45); outline-offset: 1px; }
+.board-head .head-btn.ghost { color: #1d5d86; background: #fff; border-color: #b6d2e4; box-shadow: 0 1px 2px rgba(23, 74, 110, .08); }
+.board-head .head-btn.ghost:hover:not(:disabled) { color: #125684; background: #eaf5fc; border-color: #6faad3; box-shadow: 0 2px 6px rgba(23, 74, 110, .12); }
+.board-head .head-btn.ghost.merge { color: #1c6b4c; border-color: #a6d6bf; }
+.board-head .head-btn.ghost.merge:hover:not(:disabled) { color: #145c40; background: #ecf8f2; border-color: #5fb08a; }
+.board-head .head-btn.primary { color: #fff; background: linear-gradient(#3d9ce0, #1f7cc0); border-color: #1a6ead; box-shadow: 0 1px 3px rgba(31, 124, 192, .3), inset 0 1px rgba(255, 255, 255, .22); }
+.board-head .head-btn.primary:hover:not(:disabled) { background: linear-gradient(#4aa8ea, #2387cd); box-shadow: 0 3px 9px rgba(31, 124, 192, .32), inset 0 1px rgba(255, 255, 255, .22); }
+.board-head .head-btn.success { color: #fff; background: linear-gradient(#3fb38a, #23896a); border-color: #1d7759; box-shadow: 0 1px 3px rgba(35, 137, 106, .3), inset 0 1px rgba(255, 255, 255, .22); }
+.board-head .head-btn.success:hover:not(:disabled) { background: linear-gradient(#49c095, #279573); box-shadow: 0 3px 9px rgba(35, 137, 106, .32), inset 0 1px rgba(255, 255, 255, .22); }
+.board-head .head-btn:disabled { cursor: not-allowed; color: #9fb0bc; background: #f2f5f7; border-color: #d7e0e6; box-shadow: none; }
+.board-head .maximize-toggle { width: 30px; height: 30px; flex: none; display: grid; place-items: center; padding: 0; color: #1d6a9e; background: #fff; border: 1px solid #b6d2e4; border-radius: 6px; cursor: pointer; box-shadow: 0 1px 2px rgba(23, 74, 110, .08); transition: background .15s ease, border-color .15s ease, color .15s ease; }
+.board-head .maximize-toggle svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.board-head .maximize-toggle:hover, .board-head .maximize-toggle:focus-visible { color: #125684; background: #eaf5fc; border-color: #6faad3; outline: none; }
+.board-head .maximize-toggle.active { color: #fff; background: #1f6fb0; border-color: #175d95; }
 /* 标题左侧的全屏按钮（斜向双箭头）；全屏时只保留该栏 */
-.maximize-toggle { width: 26px; height: 26px; flex: none; display: grid; place-items: center; padding: 0; color: #1d6a9e; background: #f5fbff; border: 1px solid #8ebbd5; border-radius: 3px; cursor: pointer; }
-.maximize-toggle svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
-.maximize-toggle:hover, .maximize-toggle:focus-visible { color: #fff; background: #2d86c3; border-color: #1d70aa; outline: none; }
-.maximize-toggle.active { color: #fff; background: #1f6fb0; border-color: #175d95; }
 .scheduler-shell.maximized .machine-groups, .scheduler-shell.maximized .board-splitter { display: none; }
 .scheduler-shell.maximized .boards { grid-template-columns: minmax(0, 1fr); }
 .scheduler-shell.maximized .boards > .board { grid-column: 1; }
@@ -247,6 +245,7 @@ button { color: inherit; }
 .empty span { font-size: 11px; }
 .drop-empty { background: #f6faf8; border-color: #bcd3ca; }
 footer { flex: none; height: 22px; display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; color: #929ba6; font-size: 10px; }
+footer .plugin-version { color: #4d7ea3; font-weight: 600; }
 .footer-status { display: flex; align-items: center; gap: 10px; }
 .sync-badge { padding: 1px 8px; color: #1d6a9e; background: #e2f1fb; border: 1px solid #b4d5ea; border-radius: 9px; font-weight: 600; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 9999; display: grid; place-items: center; background: rgba(19,48,68,.38); }
@@ -272,6 +271,18 @@ footer { flex: none; height: 22px; display: flex; align-items: flex-end; justify
 .split-modal .merge-item input { width: 15px; height: 15px; margin: 0; accent-color: #2b83c2; }
 .merge-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .merge-item b { color: #1978b9; }
+/* 合并弹窗：本机床上没有拆出的记录时——整张表里同订单的其他记录（只读）+ 补建 / 撤销 */
+.merge-missing .danger-text { margin: 4px 0 0; line-height: 1.6; }
+.merge-list.merge-elsewhere { margin-top: 10px; }
+.split-modal div.merge-item { min-height: 32px; display: grid; grid-template-columns: 28px minmax(0, 1fr) 72px; align-items: center; gap: 6px; padding: 0 10px; color: #4f6b80; border-top: 1px solid #e6eff5; font-size: 12px; }
+.merge-elsewhere-hint { margin: 0; padding: 7px 10px; color: #8a6a2c; background: #fff8e8; border-top: 1px solid #f0e2bd; font-size: 11px; line-height: 1.6; }
+.merge-recover { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.merge-recover button { height: 32px; display: inline-flex; align-items: center; padding: 0 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; white-space: nowrap; transition: background .15s ease, border-color .15s ease, box-shadow .15s ease; }
+.merge-recover .recover-create { color: #fff; background: linear-gradient(#3d9ce0, #1f7cc0); border: 1px solid #1a6ead; box-shadow: 0 1px 3px rgba(31, 124, 192, .3); }
+.merge-recover .recover-create:hover { background: linear-gradient(#4aa8ea, #2387cd); }
+.merge-recover .recover-undo { color: #1d5d86; background: #fff; border: 1px solid #b6d2e4; }
+.merge-recover .recover-undo:hover:not(:disabled) { background: #eaf5fc; border-color: #6faad3; }
+.merge-recover button:disabled { cursor: not-allowed; color: #9fb0bc; background: #f2f5f7; border-color: #d7e0e6; box-shadow: none; }
 /* 确定排程弹窗：排程单号预览 */
 .split-modal label strong.schedule-no-preview { color: #1d5d86; font-variant-numeric: tabular-nums; }
 .schedule-no-hint { margin: -6px 0 6px; color: #6f8da2; font-size: 11px; line-height: 1.6; }

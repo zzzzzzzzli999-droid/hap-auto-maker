@@ -16,6 +16,8 @@ const emitter = mdyeEmitter || {};
 let fetchedControls = [];
 let fullControlsLoaded = false;
 const buttonCache = new Map();
+// 插件版本：显示在页面左下角，publish.sh 发布时也会打印。每次改代码都更新它，用来确认明道里跑的是哪个版本。
+const PLUGIN_VERSION = "2026.10.08-3";
 
 const FIELD_ALIASES = {
   process: ["process", "工序"],
@@ -526,6 +528,34 @@ async function updateRow(payload) {
   return result;
 }
 
+// 新建记录（分拆出的记录由插件直接新建，不再依赖明道“分拆”按钮）。
+// 请求格式同明道前端：{ appId, worksheetId, viewId, rowStatus: 1, receiveControls: [{ controlId, type, value }] }；
+// 成功 { data: 新记录, resultCode: 1 }，失败 { resultCode: 11/22/31…, data: null }，按 assertRowSaved 同样的规则判断。
+async function addRow(payload) {
+  let result;
+  try {
+    if (typeof runtimeApi.addWorksheetRow === "function") result = await runtimeApi.addWorksheetRow(payload);
+    else if (typeof worksheetApi.addWorksheetRow === "function") result = await worksheetApi.addWorksheetRow(payload);
+    else if (window.api && typeof window.api.call === "function") result = await window.api.call("worksheet", "addWorksheetRow", payload);
+    else throw new Error("addWorksheetRow API unavailable");
+  } catch (error) { throw toError(error); }
+  if (result === undefined) throw new SaveRejectedError("明道没有返回新建结果");
+  await assertRowSaved(result, { worksheetId: payload.worksheetId, newOldControl: payload.receiveControls });
+  if (!result.data || !result.data.rowid) throw new SaveRejectedError("明道没有返回新建的记录");
+  return result.data;
+}
+
+// 整张表里某个生产单号的全部记录（不受当前视图筛选限制）：用来找“拆到别处”的记录。
+// 文本字段“等于”：filterType 2（同 scripts/hap 里的视图筛选格式），结果再按生产单号精确比对一次。
+async function fetchOrderRows(orderControl, orderNo, { appId, worksheetId }) {
+  if (!orderControl || !orderNo || orderNo === "—") return [];
+  const response = await getRows(compact({
+    appId, worksheetId, pageIndex: 1, pageSize: 200, notGetTotal: true,
+    filterControls: [{ controlId: orderControl.controlId, dataType: Number(orderControl.type) || 2, spliceType: 1, filterType: 2, values: [orderNo] }]
+  }));
+  return extractRows(response).map(normalizeRow).filter((row) => row.rowid && row.orderNo === orderNo);
+}
+
 async function deleteWorksheetRows({ appId, worksheetId, viewId, rowIds }) {
   let result;
   try {
@@ -1008,6 +1038,19 @@ const ScheduleCard = React.memo(function ScheduleCard({ row, index, selected, fl
 
 const CHECK_COLUMN_WIDTH = 34;
 
+// 栏标题按钮的线性图标（20×20，描边绘制）
+const BUTTON_ICONS = {
+  swap: <path d="M3.5 7h12l-3.5-3.5M16.5 13h-12l3.5 3.5" />,
+  print: <><path d="M6 7.5V3h8v4.5" /><rect x="2.5" y="7.5" width="15" height="7" rx="1.8" /><path d="M6 12h8v5H6z" /><path d="M14.5 10h.01" /></>,
+  merge: <path d="M5 3v3.5A4.5 4.5 0 0 0 9.5 11H16M13 8l3 3-3 3M5 17v-3" />,
+  checkAll: <><rect x="3" y="3" width="14" height="14" rx="3" /><path d="m6.5 10.2 2.4 2.4 4.6-5" /></>,
+  sort: <path d="M7 16V4M4 7l3-3 3 3M13 4v12M10 13l3 3 3-3" />,
+  check: <path d="m4.5 10.5 3.5 3.5 7.5-8" />
+};
+function ButtonIcon({ name }) {
+  return <svg className="btn-icon" viewBox="0 0 20 20" aria-hidden="true">{BUTTON_ICONS[name]}</svg>;
+}
+
 // 勾选列表头：勾选框（全选/全不选，部分勾选时显示半选）+ ▼ 菜单（全选、全不选）
 function SelectAllHeader({ total, selectedCount, onSelectAll, onClear }) {
   const [open, setOpen] = useState(false);
@@ -1180,6 +1223,8 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [mergeTarget, setMergeTarget] = useState(null);
   const [mergePicked, setMergePicked] = useState([]);
+  // 合并弹窗里“本机床没有拆出的记录”时，整张表里同一生产单号的其他记录：{ forId, loading, rows }
+  const [mergeElsewhere, setMergeElsewhere] = useState(null);
   // 更换机床：{ lane, rowIds, process, target }
   const [machineChange, setMachineChange] = useState(null);
   const [detailField, setDetailField] = useState(null);
@@ -1598,9 +1643,24 @@ export default function App() {
       return !selected.length || selected.includes(values[key]);
     });
   }, [rowFilterValues]);
-  const queuedBase = useMemo(() => visible
-    .filter((row) => row.status.includes(STATUS.queued) || row.__demo && row.status.includes("未排程"))
-    .sort((a, b) => a.sequence - b.sequence), [visible]);
+  // 未排程：按排程序号；本次会话里分拆出的记录紧跟在原记录后面（已排程栏在下面的排序里同样处理）
+  const queuedBase = useMemo(() => {
+    const sorted = visible
+      .filter((row) => row.status.includes(STATUS.queued) || row.__demo && row.status.includes("未排程"))
+      .sort((a, b) => a.sequence - b.sequence);
+    if (!splitGroupRef.current.size) return sorted;
+    const ids = new Set(sorted.map((row) => row.rowid));
+    const anchorOf = new Map();
+    splitGroupRef.current.forEach((identity, rowId) => { if (ids.has(rowId)) anchorOf.set(identity, rowId); });
+    const pieces = new Map();
+    const rest = [];
+    sorted.forEach((row) => {
+      const anchorId = anchorOf.get(splitIdentity(row));
+      if (anchorId && anchorId !== row.rowid) pieces.set(anchorId, [...(pieces.get(anchorId) || []), row]);
+      else rest.push(row);
+    });
+    return pieces.size ? rest.flatMap((row) => [row, ...(pieces.get(row.rowid) || [])]) : sorted;
+  }, [visible]);
   const scheduledBase = useMemo(() => {
     const rowsById = new Map(rows.map((row) => [row.rowid, row]));
     const splitAnchors = new Map();
@@ -1825,7 +1885,7 @@ export default function App() {
 
   const changeMachineButton = (lane, laneRows) => {
     const count = selectedVisibleCount(laneRows);
-    return <button type="button" className="change-machine-trigger" onClick={() => openMachineChange(lane)} title={count ? `把勾选的 ${count} 条任务更换到同工序的其他机床` : "先勾选任务，再更换到同工序的其他机床"}>更换机床{count ? ` (${count})` : ""}</button>;
+    return <button type="button" className="change-machine-trigger head-btn ghost" onClick={() => openMachineChange(lane)} title={count ? `把勾选的 ${count} 条任务更换到同工序的其他机床` : "先勾选任务，再更换到同工序的其他机床"}><ButtonIcon name="swap" />更换机床{count ? ` (${count})` : ""}</button>;
   };
 
   const openMachineMerge = () => {
@@ -2125,6 +2185,8 @@ export default function App() {
     mdyeUtils.openRecordInfo({ appId, worksheetId, viewId, recordId: row.rowid }).then(refresh);
   };
 
+  // 当前卡片已排程里有排程单号的明细（确定排程后才有），有才能打印
+  const printableCount = scheduled.filter((row) => !isVirtualRow(row) && row.scheduleNo).length;
   // 打印排程表：打开已排程明细关联的“排程汇总表”记录（在汇总记录里打印）。
   // 同一批明细关联同一张汇总表；取当前卡片已排程里被关联最多的那张，视图数据没带出关联值时向明道查第一条明细的关联记录。
   const [openingSummary, setOpeningSummary] = useState(false);
@@ -2134,9 +2196,10 @@ export default function App() {
       setNotice("未找到“排程汇总表”字段：请在明道云表中添加关联“排程汇总”表的字段“排程汇总表”，或在插件设置中映射");
       return;
     }
-    const details = scheduled.filter((row) => !isVirtualRow(row));
+    // 只有确定排程、生成了排程单号的明细才能打印
+    const details = scheduled.filter((row) => !isVirtualRow(row) && row.scheduleNo);
     if (!details.length) {
-      setNotice("已排程里没有任务，无法打印排程表");
+      setNotice("这批任务还没有排程单号：请先点“确定排程”生成排程单号和汇总表，再打印");
       return;
     }
     if (!mdyeUtils || typeof mdyeUtils.openRecordInfo !== "function") {
@@ -2224,6 +2287,45 @@ export default function App() {
 
   // 分拆：弹窗立即关闭，原记录立即显示保留量，并在其下方插入“生成中”的占位行；
   // 后台依次写入保留量、触发“分拆”按钮，新记录返回后自动替换占位行。
+  // ---- 分拆：由插件直接新建拆出的记录 ----
+  // 原来点明道“分拆”自定义按钮触发工作流；插件视图里找不到这个按钮时（“当前视图未找到‘分拆’自定义按钮”）
+  // 只改了原记录的排程量，拆出的数量哪儿也没有。现在插件直接新建：复制原记录的字段，
+  // 排程量 = 拆前数量 = 拆出数量；合格量、开始/结束时间不复制；工序、机床、状态、排程单号与原记录相同，紧跟在原记录后面。
+  // 只复制可写入的字段类型；公式、汇总、他表字段、子表、附件、自动编号等由明道生成或不适合复制，不传。
+  const SPLIT_COPY_TYPES = new Set([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 19, 23, 24, 26, 27, 28, 29, 36, 41, 46, 48]);
+  const SYSTEM_CONTROL_IDS = new Set(["rowid", "ctime", "utime", "ownerid", "caid", "uaid", "daid", "dtime", "wfname", "wfcuaids", "wfcaid", "wfctime", "wfrtime", "wfftime", "wfdtime", "wfstatus", "wfcotime", "uid", "rowuuid"]);
+  const buildSplitControls = (source, quantity) => {
+    const raw = source.__raw || {};
+    const idsOf = (keys) => new Set(keys.map((key) => (resolveField(key) || {}).controlId).filter(Boolean));
+    const quantityIds = idsOf(["scheduleQuantity", "preSplitScheduleQuantity"]);
+    const skipIds = idsOf(["qualifiedQuantity", "scheduleStartTime", "scheduleEndTime", "splitDifference"]);
+    return controlsFromConfig().map((control) => {
+      const type = Number(control.type);
+      if (!SPLIT_COPY_TYPES.has(type) || SYSTEM_CONTROL_IDS.has(control.controlId) || skipIds.has(control.controlId)) return null;
+      let value;
+      if (quantityIds.has(control.controlId)) value = encodeValue(control, quantity);
+      else if (type === 29) {
+        // 关联记录按明道前端格式写入；列表样式的关联字段在行数据里只有数量，没法复制
+        const items = relationItems(raw[control.controlId]);
+        if (!items || !items.length) return null;
+        value = JSON.stringify(items.filter((item) => item && item.sid).map((item) => ({ name: item.name, sid: item.sid, sourcevalue: false })));
+      } else if ([19, 23, 24].includes(type)) {
+        // 地区：读出来是 {code, name}，写入只要 code
+        try { value = JSON.parse(raw[control.controlId]).code; } catch (_) { return null; }
+      } else {
+        value = raw[control.controlId];
+        if (value && typeof value === "object") value = JSON.stringify(value);
+      }
+      if (value === undefined || value === null || value === "" || value === "[]") return null;
+      return { controlId: control.controlId, controlName: control.controlName, type: control.type, dot: control.dot, value: String(value) };
+    }).filter(Boolean);
+  };
+  // 新建拆出的记录，返回整理好的新记录（工序、机床、状态与原记录相同，界面直接显示，不用等刷新）
+  const createSplitPiece = async (source, quantity) => {
+    const created = await addRow(compact({ appId, worksheetId, viewId, rowStatus: 1, pushUniqueId: getPushUniqueId(), receiveControls: buildSplitControls(source, quantity) }));
+    return normalizeRow(created);
+  };
+
   const confirmSplit = () => {
     if (!splitTarget) return;
     const target = splitTarget;
@@ -2257,45 +2359,64 @@ export default function App() {
       baselineIds: new Set(rows.filter((row) => !row.__pending && splitOrderIdentity(row) === orderIdentity).map((row) => row.rowid))
     };
     pendingSplitsRef.current.set(tempId, split);
-    const optimistic = applyOptimistic(new Map([[source.rowid, { scheduleQuantity: retainedAmount }]]));
+    // 拆前数量比原排程量小（没填或旧数据）时一并改成原排程量，分拆差量 = 拆出数量，之后才能“合并”回来
+    const preControl = resolveField("preSplitScheduleQuantity");
+    const updatePre = Boolean(preControl) && (Number(source.preSplitScheduleQuantity) || 0) < originalAmount;
+    const optimistic = applyOptimistic(new Map([[source.rowid, { scheduleQuantity: retainedAmount, ...(updatePre ? { preSplitScheduleQuantity: originalAmount } : {}) }]]));
     setRows((current) => {
       const index = current.findIndex((row) => row.rowid === source.rowid);
       const next = current.slice();
       next.splice(index < 0 ? next.length : index + 1, 0, placeholder);
       return next;
     });
-    setNotice(`已分拆：保留 ${retainedAmount}，拆出 ${splitQuantity}，新记录生成中…`);
+    setNotice(`正在分拆：保留 ${retainedAmount}，拆出 ${splitQuantity}…`);
     let quantitySaved = !scheduleQuantityControl;
+    const writeQuantity = (amount, pre) => updateRow({
+      appId, worksheetId, viewId, rowId: source.rowid,
+      newOldControl: [
+        { controlId: scheduleQuantityControl.controlId, controlName: scheduleQuantityControl.controlName, type: scheduleQuantityControl.type, value: encodeValue(scheduleQuantityControl, amount) },
+        ...(pre !== undefined ? [{ controlId: preControl.controlId, controlName: preControl.controlName, type: preControl.type, value: encodeValue(preControl, pre) }] : [])
+      ]
+    });
     enqueueSync(async () => {
       if (scheduleQuantityControl) {
-        await updateRow({
-          appId, worksheetId, viewId, rowId: source.rowid,
-          newOldControl: [{ controlId: scheduleQuantityControl.controlId, controlName: scheduleQuantityControl.controlName, type: scheduleQuantityControl.type, value: encoded }]
-        });
+        await writeQuantity(retainedAmount, updatePre ? originalAmount : undefined);
         quantitySaved = true;
       }
-      const button = await findWorksheetButton("分拆", { appId, worksheetId, viewId, rowId: source.rowid });
-      const btnId = button && button.btnId;
-      if (!btnId) throw new Error("当前视图未找到“分拆”自定义按钮");
-      const payload = compact({ appId: worksheetId, sources: [source.rowid], triggerId: btnId, pushUniqueId: getPushUniqueId(), viewId, isAll: false, dataLog: `原排程量：${originalAmount}；保留排程量：${retainedAmount}；拆出数量：${splitQuantity}` });
-      window.__machineSchedulerLastSplitAction = { button, payload };
-      await startProcess(payload);
+      try {
+        return await createSplitPiece(source, splitQuantity);
+      } catch (error) {
+        // 新记录没建成：排程量改回原值，拆出的数量不会丢
+        if (scheduleQuantityControl && quantitySaved) {
+          await writeQuantity(originalAmount).then(() => { quantitySaved = false; }).catch(() => undefined);
+        }
+        throw error;
+      }
     })
-      .then(() => {
+      .then((created) => {
         optimistic.saved();
-        split.submittedAt = Date.now();
+        pendingSplitsRef.current.delete(tempId);
         splitGroupRef.current.set(source.rowid, identity);
-        scheduleRefresh(1500);
+        // 用明道返回的新记录替换占位行，紧跟在原记录后面
+        setRows((current) => {
+          const without = current.filter((row) => row.rowid !== tempId);
+          if (without.some((row) => row.rowid === created.rowid)) return without;
+          const index = without.findIndex((row) => row.rowid === source.rowid);
+          without.splice(index < 0 ? without.length : index + 1, 0, created);
+          return without;
+        });
+        flashRows([created.rowid]);
+        setNotice(`已分拆：保留 ${retainedAmount}，拆出 ${splitQuantity}，新记录紧跟在原记录后面（黄色高亮）`);
       })
       .catch((error) => {
         pendingSplitsRef.current.delete(tempId);
         setRows((current) => current.filter((row) => row.rowid !== tempId));
-        if (quantitySaved) {
+        if (quantitySaved && scheduleQuantityControl) {
           optimistic.saved();
-          setNotice(`排程量已改为 ${retainedAmount}，但分拆失败：${error.message || "请检查自定义按钮配置"}`);
+          setNotice(`分拆失败：${error.message || "请检查字段权限"}；排程量已改为 ${retainedAmount} 但未能改回 ${originalAmount}，请手动改回`);
         } else {
           optimistic.rollback();
-          setNotice(`分拆失败，已恢复：${error.message || "请检查自定义按钮配置"}`);
+          setNotice(`分拆失败，排程量仍为 ${originalAmount}：${error.message || "请检查字段权限"}`);
         }
       });
   };
@@ -2488,6 +2609,57 @@ export default function App() {
     const candidates = mergeCandidatesFor(row);
     setMergeTarget(row);
     setMergePicked(candidates.filter((item) => item.process === row.process && item.status === row.status).map((item) => item.rowid));
+    setMergeElsewhere(null);
+    // 本机床上没有拆出的记录：到整张表里查同一生产单号的其他记录（可能被建到了别的工序/机床/状态），给出补建或撤销
+    if (!candidates.length) {
+      setMergeElsewhere({ forId: row.rowid, loading: true, rows: [] });
+      fetchOrderRows(resolveField("orderNo"), row.orderNo, { appId, worksheetId })
+        .then((list) => list.filter((item) => item.rowid !== row.rowid && item.productCode === row.productCode && item.productName === row.productName
+          && splitIdentity(item) !== splitIdentity(row)))
+        .catch(() => [])
+        .then((list) => setMergeElsewhere((current) => current && current.forId === row.rowid ? { forId: row.rowid, loading: false, rows: list } : current));
+    }
+  };
+
+  // 没找到拆出的记录时的两种处理：补建拆出的记录（数量 = 分拆差量），或撤销分拆（排程量恢复为拆前数量）
+  const recreateSplitPiece = (target) => {
+    const quantity = Number(target.splitDifference) || 0;
+    if (quantity <= 0) return;
+    setMergeTarget(null);
+    setNotice(`正在补建拆出的记录（${quantity}）…`);
+    enqueueSync(() => createSplitPiece(target, quantity))
+      .then((created) => {
+        splitGroupRef.current.set(target.rowid, splitIdentity(target));
+        setRows((current) => {
+          if (current.some((row) => row.rowid === created.rowid)) return current;
+          const next = current.slice();
+          const index = next.findIndex((row) => row.rowid === target.rowid);
+          next.splice(index < 0 ? next.length : index + 1, 0, created);
+          return next;
+        });
+        flashRows([created.rowid]);
+        setNotice(`已补建拆出的记录：${target.orderNo} 拆出 ${quantity}，紧跟在原记录后面（黄色高亮）`);
+      })
+      .catch((error) => setNotice(`补建拆出记录失败：${error.message || "请检查字段权限"}`));
+  };
+  const undoSplit = (target) => {
+    const pre = Number(target.preSplitScheduleQuantity) || 0;
+    if (!scheduleQuantityControl || pre <= Number(target.scheduleQuantity)) return;
+    let encoded;
+    try { encoded = encodeValue(scheduleQuantityControl, pre); } catch (error) { setNotice(`撤销分拆失败：${error.message}`); return; }
+    setMergeTarget(null);
+    const optimistic = applyOptimistic(new Map([[target.rowid, { scheduleQuantity: pre, splitDifference: 0 }]]));
+    flashRows([target.rowid]);
+    setNotice(`已撤销分拆：${target.orderNo} 排程量恢复为 ${pre}`);
+    enqueueSync(() => updateRow({
+      appId, worksheetId, viewId, rowId: target.rowid,
+      newOldControl: [{ controlId: scheduleQuantityControl.controlId, controlName: scheduleQuantityControl.controlName, type: scheduleQuantityControl.type, value: encoded }]
+    }))
+      .then(() => optimistic.saved())
+      .catch((error) => {
+        optimistic.rollback();
+        setNotice(`撤销分拆失败，已恢复：${error.message || "请检查排程量字段权限"}`);
+      });
   };
 
   const confirmMergeSplit = () => {
@@ -2692,7 +2864,7 @@ export default function App() {
 
       <section className={`boards ${hiddenPane ? `hide-${hiddenPane}` : ""}`} ref={boardsRef} style={{ "--left-width": `${leftWidth}%` }}>
         <div className={`board unscheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("queued", e)}>
-          <div className="board-head"><div>{maximizeButton("queued", "未排程")}<span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{selectedVisibleCount(unscheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(unscheduled)}</em>}{changeMachineButton("queued", unscheduled)}{activeMachineInfo && mergeTargetMachines.length > 0 && <button className="merge-machine-trigger" onClick={openMachineMerge}>合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button className="select-visible" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}>{unscheduled.length && selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("queued")} disabled={!unscheduled.length}><span>⇅</span> 自动排序</button></div></div>
+          <div className="board-head"><div>{maximizeButton("queued", "未排程")}<span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{selectedVisibleCount(unscheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(unscheduled)}</em>}{changeMachineButton("queued", unscheduled)}{activeMachineInfo && mergeTargetMachines.length > 0 && <button type="button" className="merge-machine-trigger head-btn ghost merge" onClick={openMachineMerge}><ButtonIcon name="merge" />合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button type="button" className="select-visible head-btn ghost" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}><ButtonIcon name="checkAll" />{unscheduled.length && selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button type="button" className="head-btn primary" onClick={() => autoSort("queued")} disabled={!unscheduled.length}><ButtonIcon name="sort" />自动排序</button></div></div>
           <div className="list-table">
             <div className="list-head" style={queuedTableStyle}><SelectAllHeader key="check" total={unscheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(unscheduled)} onSelectAll={() => setLaneChecked(unscheduled, true)} onClear={() => setLaneChecked(unscheduled, false)} />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={queuedFilters[fieldKeys[index]]} options={() => queuedColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("queued", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
             <VirtualCardList rows={unscheduled} resetKey={activeMachineKey} focus={flash} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty"><strong>没有未排程任务</strong><span>当前机床暂无可排程订单</span></div>} />
@@ -2702,7 +2874,7 @@ export default function App() {
         <div className="board-splitter" onPointerDown={beginResize} onDoubleClick={togglePanes} title={hiddenPane ? "双击还原左右两栏" : "拖动调整左右区域宽度；双击隐藏/还原左右区域"}><span /></div>
 
         <div className={`board scheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("scheduled", e)}>
-          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}{changeMachineButton("scheduled", scheduled)}<button type="button" className="print-schedule-trigger" onClick={openScheduleSummary} disabled={openingSummary || !scheduled.length} title="打开已排程明细关联的排程汇总表，在汇总表里打印">{openingSummary ? "打开中…" : "打印排程表"}</button></div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button className="select-visible" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}>{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><span>⇅</span> 自动排序</button><button className="confirm-schedule" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><span>✓</span>{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
+          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}{changeMachineButton("scheduled", scheduled)}<button type="button" className="print-schedule-trigger head-btn ghost" onClick={openScheduleSummary} disabled={openingSummary || !printableCount} title={printableCount ? "打开这批排程单号的排程汇总表，在汇总表里打印" : "点“确定排程”生成排程单号后才能打印"}><ButtonIcon name="print" />{openingSummary ? "打开中…" : "打印排程表"}</button></div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button type="button" className="select-visible head-btn ghost" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}><ButtonIcon name="checkAll" />{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button type="button" className="head-btn primary" onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><ButtonIcon name="sort" />自动排序</button><button type="button" className="confirm-schedule head-btn success" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><ButtonIcon name="check" />{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
           <div className="list-table">
             <div className="list-head" style={tableStyle}><SelectAllHeader key="check" total={scheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(scheduled)} onSelectAll={() => setLaneChecked(scheduled, true)} onClear={() => setLaneChecked(scheduled, false)} /><FilterHeader key="sequence" columnKey="__sequence" label="序号" value={scheduledFilters.sequence} options={() => scheduledColumnOptions("sequence")} onChange={(value) => setColumnFilter("scheduled", "sequence", value)} layoutLocked />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={scheduledFilters[fieldKeys[index]]} options={() => scheduledColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("scheduled", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
             <VirtualCardList rows={scheduled} resetKey={activeMachineKey} focus={flash} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} scheduled selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty drop-empty"><strong>拖到这里开始排程</strong><span>任务会自动生成排程序号</span></div>} />
@@ -2757,8 +2929,23 @@ export default function App() {
               <span>{row.machine} / {row.status}</span>
               <b>{row.scheduleQuantity}</b>
             </label>)}
-          </div> : <p className="danger-text">当前视图里没有找到“{target.machine}”上同一生产单号、同一产品的其他记录，无法合并（其他机床、其他工序的记录不能合并）。</p>}
-          <p className="split-hint">合并后排程量：<strong>{own} + {added} = {own + added}</strong><br />勾选的 {picked.length} 条记录合并后移入明道云回收站。</p>
+          </div> : <div className="merge-missing">
+            <p className="danger-text">“{target.machine}”上没有找到从这条记录拆出的记录（分拆差量 {target.splitDifference}）。多半是之前分拆时明道没有生成新记录，拆出的数量现在只记在“分拆差量”里。</p>
+            {mergeElsewhere && mergeElsewhere.forId === target.rowid && (mergeElsewhere.loading
+              ? <p className="split-hint">正在整张表里查找同一生产单号的其他记录…</p>
+              : mergeElsewhere.rows.length
+                ? <div className="merge-list merge-elsewhere">
+                    <div className="merge-list-head"><span /><span>同一生产单号的其他记录（工序 / 机床 / 状态）</span><span>排程量</span></div>
+                    {mergeElsewhere.rows.map((row) => <div key={row.rowid} className="merge-item"><span /><span>{row.process} / {row.machine} / {row.status}</span><b>{row.scheduleQuantity}</b></div>)}
+                    <p className="merge-elsewhere-hint">如果其中一条就是拆出的记录，请把它改到“{target.machine}”（工序、机床相同）后再来合并，不要再补建。</p>
+                  </div>
+                : <p className="split-hint">整张表里也没有同一生产单号、同一产品的其他记录。</p>)}
+            <div className="merge-recover">
+              <button type="button" className="recover-create" onClick={() => recreateSplitPiece(target)}>补建拆出记录（{target.splitDifference}）</button>
+              <button type="button" className="recover-undo" onClick={() => undoSplit(target)} disabled={!scheduleQuantityControl || !(Number(target.preSplitScheduleQuantity) > own)}>撤销分拆（排程量恢复为 {Number(target.preSplitScheduleQuantity) || own}）</button>
+            </div>
+          </div>}
+          {mergeCandidates.length > 0 && <p className="split-hint">合并后排程量：<strong>{own} + {added} = {own + added}</strong><br />勾选的 {picked.length} 条记录合并后移入明道云回收站。</p>}
           <div className="modal-actions"><button className="secondary" onClick={() => setMergeTarget(null)}>取消</button><button className="primary" onClick={confirmMergeSplit} disabled={!picked.length}>确认合并</button></div>
         </div></div>;
       })()}
@@ -2767,7 +2954,7 @@ export default function App() {
 
       {detailField && <div className="modal-backdrop" onMouseDown={() => setDetailField(null)}><div className="detail-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title">{detailField.label}</div><div className="detail-content">{detailField.value || "—"}</div><div className="modal-actions"><button className="primary" onClick={() => setDetailField(null)}>关闭</button></div></div></div>}
 
-      <footer><span>双击任务可打开记录详情 · 双击中间分隔线可隐藏/还原左右区域</span><span className="footer-status">{syncCount > 0 && <b className="sync-badge">正在后台保存 {syncCount} 项…</b>}{loading ? "正在加载…" : `当前显示 ${visible.filter((row) => !row.__pending).length} 条任务`}</span></footer>
+      <footer><span>双击任务可打开记录详情 · 双击中间分隔线可隐藏/还原左右区域 · <b className="plugin-version">插件版本 {PLUGIN_VERSION}</b></span><span className="footer-status">{syncCount > 0 && <b className="sync-badge">正在后台保存 {syncCount} 项…</b>}{loading ? "正在加载…" : `当前显示 ${visible.filter((row) => !row.__pending).length} 条任务`}</span></footer>
     </main>
   );
 }

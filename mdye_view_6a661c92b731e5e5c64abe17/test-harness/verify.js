@@ -79,6 +79,8 @@ async function waitIdle(page, timeout = 20000) {
   const surface = groups.find((group) => group.process === "表面处理");
   check("表面处理只剩非合并机床（覆膜/上油/贴面机）", surface && surface.cards.map((c) => c.name).sort().join() === ["上油", "覆膜", "贴面机"].sort().join(), surface && surface.cards.map((c) => c.name).join());
   check("默认选中联动线合并卡片", lianDong[0]?.active === true);
+  const versionText = await page.textContent("footer .plugin-version").catch(() => "");
+  check("页面左下角显示插件版本（用来确认明道里跑的是哪个版本）", /^插件版本 \d{4}\.\d{2}\.\d{2}-\d+$/.test((versionText || "").trim()), versionText);
 
   const heads = await page.$$eval(".unscheduled-board .list-head > *", (els) => els.map((el) => el.textContent.replace(/[▼⋮]/g, "").trim()).filter(Boolean));
   check("合并卡片明细第一列为“机床”", heads[0] === "机床", heads.slice(0, 4).join(","));
@@ -195,8 +197,8 @@ async function waitIdle(page, timeout = 20000) {
     const rows = Array.from(document.querySelectorAll(".unscheduled-board .schedule-row"));
     return { pending: document.querySelectorAll(".pending-row").length, quantities: rows.map((row) => row.querySelector(".quantity-cell input").value) };
   });
-  const splitCalls = await page.evaluate(() => window.__mock.calls.filter((c) => c.action === "startProcess" && c.data.triggerId === "b_split").length);
-  check("分拆按钮已在后台触发，新记录替换占位行", splitCalls === 1 && afterSplitSaved.pending === 0 && afterSplitSaved.quantities.includes("100"), JSON.stringify(afterSplitSaved));
+  const splitCalls = await page.evaluate(() => window.__mock.calls.filter((c) => c.action === "addWorksheetRow" || (c.action === "startProcess" && c.data.triggerId === "b_split")).map((c) => c.action));
+  check("分拆在后台直接新建记录（不再依赖明道“分拆”按钮），新记录替换占位行", splitCalls.join() === "addWorksheetRow" && afterSplitSaved.pending === 0 && afterSplitSaved.quantities.includes("100"), `${splitCalls.join()}；${JSON.stringify(afterSplitSaved)}`);
 
   // 2d 失败回滚：完成生产失败后记录恢复
   await clickCard(page, "平模机");
@@ -866,19 +868,22 @@ async function waitIdle(page, timeout = 20000) {
       const delNotice12 = await notice12();
       check("删除被明道拒绝：记录恢复，提示“删除失败”", (await laneOrders("unscheduled-board")).includes(delOrder12) && /删除失败/.test(delNotice12) && Boolean(await store12(delOrder12)), delNotice12);
     });
-    // 12g 分拆：工作流没有启动（startProcess 返回 false）→ 提示原因，不留占位行
-    await step("12g 分拆工作流未启动", async () => {
+    // 12g 分拆：新建拆出的记录被明道拒绝 → 排程量改回原值，不留占位行
+    await step("12g 分拆新建被拒绝", async () => {
       const splitOrder12 = (await laneOrders("unscheduled-board"))[0];
+      const splitQty12 = Number(await page.locator(".unscheduled-board .schedule-row").first().locator(".quantity-cell input").inputValue());
       const splitCountBefore = await page.evaluate(() => window.__mock.store.size);
-      await page.evaluate(() => { window.__mock.processRejectNext = 1; });
+      await page.evaluate(() => { window.__mock.addRejectNext = [{ resultCode: 31 }]; });
       await page.locator(".unscheduled-board .schedule-row").first().locator(".split-icon").click();
       await page.waitForSelector(".split-modal input[type=number]");
       await page.fill(".split-modal input[type=number]", "100");
       await page.click(".split-modal .primary");
       await waitIdle(page);
       const splitNotice12 = await notice12();
-      check("分拆工作流没有启动：提示“记录不满足执行条件或流程尚未启用”，不留占位行", /分拆失败/.test(splitNotice12) && /记录不满足执行条件或流程尚未启用/.test(splitNotice12) && (await page.evaluate(() => window.__mock.store.size)) === splitCountBefore && !(await page.$(".schedule-row.pending-row")), `${splitOrder12}：${splitNotice12}`);
+      const storeQty12 = await page.evaluate((o) => Number(Array.from(window.__mock.store.values()).find((r) => r.c_order === o).c_qty), splitOrder12);
+      check("分拆新建被明道拒绝：排程量改回原值、提示原因，不留占位行", /分拆失败，排程量仍为/.test(splitNotice12) && /有必填字段未填写/.test(splitNotice12) && storeQty12 === splitQty12 && (await page.evaluate(() => window.__mock.store.size)) === splitCountBefore && !(await page.$(".schedule-row.pending-row")), `${splitOrder12}：明道排程量 ${storeQty12}/${splitQty12}；${splitNotice12}`);
     });
+
     // 12h 确定排程：工作流没有启动 → 明确提示单号已写入但工作流没执行
     await step("12h 确定排程工作流未启动", async () => {
       await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
@@ -934,14 +939,15 @@ async function waitIdle(page, timeout = 20000) {
       const last = (await opened()).pop();
       check("确定排程后（工作流生成新汇总表并关联），打开的是新排程单号的汇总表", Boolean(newNo) && newNo !== "印刷20261001001" && last && last.recordId === await summarySid(newNo), `${newNo} ${JSON.stringify(last)}`);
     });
-    await step13("13c 没有汇总表", async () => {
+    await step13("13c 没有排程单号不能打印", async () => {
       await clickCard(page, "大五色印刷");
       await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
       await waitIdle(page);
-      const before = (await opened()).length;
-      await page.click(".scheduled-board .print-schedule-trigger");
-      await page.waitForFunction(() => /还没有排程汇总表/.test((document.querySelector(".notice") || {}).textContent || ""), null, { timeout: 10000 }).catch(() => undefined);
-      check("这批还没有汇总表时不打开，提示先确定排程", (await opened()).length === before && /还没有排程汇总表/.test(await notice13()), await notice13());
+      const btn = await page.$eval(".scheduled-board .print-schedule-trigger", (el) => ({ disabled: el.disabled, title: el.title }));
+      check("这批还没有排程单号时“打印排程表”不可点，提示先确定排程", btn.disabled && /确定排程/.test(btn.title), JSON.stringify(btn));
+      await clickCard(page, "联动线");
+      const enabled = await page.$eval(".scheduled-board .print-schedule-trigger", (el) => !el.disabled);
+      check("有排程单号的批次“打印排程表”可点", enabled);
     });
     check("页面无脚本错误（打印排程表）", page.__errors.length === 0, page.__errors.join(" | "));
   }
@@ -989,7 +995,7 @@ async function waitIdle(page, timeout = 20000) {
     const pieces14 = await page.evaluate((order) => Array.from(window.__mock.store.values()).filter((r) => r.c_order === order).map((r) => ({ id: r.rowid, process: r.c_process, machine: r.c_machine, qty: Number(r.c_qty) })), srcOrder);
     const newPiece = pieces14.find((p) => !["r9001", "r9002"].includes(p.id) && p.qty === 100);
     const notice14 = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
-    check("分拆工作流把新记录建在别的机床（打包）上时，插件改回原记录的机床（上油）", newPiece && newPiece.machine === "上油" && newPiece.process === "表面处理" && !/还未生成|失败/.test(notice14), `${JSON.stringify(pieces14)}；${notice14}`);
+    check("分拆由插件直接新建：拆出的记录在原记录的机床（上油）上，不会跑到别的机床", newPiece && newPiece.machine === "上油" && newPiece.process === "表面处理" && !/还未生成|失败/.test(notice14), `${JSON.stringify(pieces14)}；${notice14}`);
     const uiOrders14 = await columnValues(page, "unscheduled-board", "生产单号");
     check("拆出的记录显示在原机床（上油）卡片里", uiOrders14.filter((o) => o === srcOrder).length === 2, uiOrders14.filter((o) => o === srcOrder).length + " 条");
     const srcIndex2 = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(srcOrder);
@@ -1004,6 +1010,93 @@ async function waitIdle(page, timeout = 20000) {
     await page.click(".merge-modal .secondary");
     check("页面无脚本错误（合并只限本机床）", page.__errors.length === 0, page.__errors.join(" | "));
   } catch (error) { check("14 合并只限本机床（步骤异常）", false, String(error.message).split("\n")[0]); }
+  await page.close();
+
+  // ---------- 15. 插件视图里没有“分拆”按钮也能分拆；之前没生成拆出记录的可补建或撤销 ----------
+  page = await open(browser, "latency=300&nosplitbtn=1");
+  {
+    const store15 = (order) => page.evaluate((o) => Array.from(window.__mock.store.values()).filter((r) => r.c_order === o).map((r) => ({ id: r.rowid, machine: r.c_machine, process: r.c_process, status: r.c_status, qty: Number(r.c_qty), pre: Number(r.c_pre), customer: r.c_customer, name: r.c_name, size: r.c_size })), order);
+    const notice15 = () => page.$eval(".notice", (el) => el.textContent).catch(() => "");
+    const refresh15 = async () => { await page.evaluate(() => window.postMessage({ type: "refresh" }, "*")); await page.waitForTimeout(1500); };
+    const step15 = async (name, fn) => { try { await fn(); } catch (error) { check(`${name}（步骤异常）`, false, String(error && error.message || error).split("\n")[0]); } };
+
+    await step15("15a 没有分拆按钮也能分拆", async () => {
+      await clickCard(page, "上油");
+      const order = (await columnValues(page, "unscheduled-board", "生产单号"))[2];
+      const row = page.locator(".unscheduled-board .schedule-row").nth(2);
+      const qty = Number(await row.locator(".quantity-cell input").inputValue());
+      await row.locator(".split-icon").click();
+      await page.fill(".split-modal input", String(qty - 120));
+      await page.click(".split-modal .primary");
+      await waitIdle(page);
+      const pieces = await store15(order);
+      const n = await notice15();
+      check("插件视图里没有“分拆”按钮时，分拆照样新建拆出的记录（以前只改了排程量）", pieces.length === 2 && pieces.some((p) => p.qty === qty - 120 && p.pre === qty) && pieces.some((p) => p.qty === 120 && p.pre === 120) && /已分拆/.test(n) && !/未找到/.test(n), `${JSON.stringify(pieces.map((p) => [p.qty, p.pre]))}；${n}`);
+      check("拆出的记录复制了原记录：工序、机床、状态、客户、产品、尺寸都相同", pieces.length === 2 && ["machine", "process", "status", "customer", "name", "size"].every((key) => pieces[0][key] === pieces[1][key]), JSON.stringify(pieces));
+      const uiOrders = await columnValues(page, "unscheduled-board", "生产单号");
+      const idx = uiOrders.indexOf(order);
+      const qtys = await page.$$eval(".unscheduled-board .schedule-row .quantity-cell input", (els) => els.map((el) => el.value));
+      const flashed = await page.locator(".unscheduled-board .schedule-row").nth(idx + 1).evaluate((el) => el.classList.contains("row-flash"));
+      check("拆出的记录紧跟在原记录下面并黄色高亮（刷新后仍在原记录下面）", uiOrders[idx + 1] === order && qtys[idx] === String(qty - 120) && qtys[idx + 1] === "120" && flashed, `${uiOrders.slice(idx, idx + 3).join(",")} / ${qtys.slice(idx, idx + 3).join(",")} / 高亮 ${flashed}`);
+      const flow = await page.evaluate(() => window.__mock.calls.filter((c) => c.action === "addWorksheetRow" || c.action === "startProcess").map((c) => c.action));
+      check("分拆不再调用明道“分拆”按钮，直接新建记录", flow.join() === "addWorksheetRow", flow.join());
+    });
+
+    await step15("15b 补建拆出记录", async () => {
+      // 模拟之前分拆时明道没生成新记录：排程量改成 100，拆前数量还是原排程量；整张表里还有一条同订单的“打包”记录
+      await clickCard(page, "覆膜");
+      const order = (await columnValues(page, "unscheduled-board", "生产单号"))[0];
+      const before = await page.evaluate((o) => {
+        const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o);
+        const pre = Number(r.c_qty);
+        r.c_pre = String(pre); r.c_qty = "100";
+        window.__mock.store.set("r9101", { ...r, rowid: "r9101", c_process: "打包", c_machine: "打包", c_qty: "10000", c_pre: "10000" });
+        return pre;
+      }, order);
+      await refresh15();
+      const idx = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(order);
+      await page.locator(".unscheduled-board .schedule-row").nth(idx).locator(".merge-icon").click();
+      await page.waitForSelector(".merge-modal .merge-recover");
+      await page.waitForFunction(() => !/正在整张表里查找/.test(document.querySelector(".merge-modal").textContent), null, { timeout: 8000 });
+      const dialog = await page.evaluate(() => ({
+        candidates: document.querySelectorAll(".merge-modal .merge-list:not(.merge-elsewhere) .merge-item").length,
+        missing: (document.querySelector(".merge-modal .merge-missing .danger-text") || {}).textContent || "",
+        elsewhere: Array.from(document.querySelectorAll(".merge-modal .merge-elsewhere .merge-item")).map((el) => el.textContent),
+        buttons: Array.from(document.querySelectorAll(".merge-modal .merge-recover button")).map((el) => el.textContent)
+      }));
+      check("没有拆出的记录时：说明原因，并列出整张表里同一生产单号的其他记录（打包 10000）", dialog.candidates === 0 && /没有找到从这条记录拆出的记录/.test(dialog.missing) && dialog.elsewhere.length === 1 && dialog.elsewhere[0].includes("打包") && dialog.elsewhere[0].includes("10000"), JSON.stringify(dialog));
+      check("提供“补建拆出记录”和“撤销分拆”两个处理按钮", dialog.buttons.length === 2 && dialog.buttons[0].includes(String(before - 100)) && dialog.buttons[1].includes(String(before)), dialog.buttons.join(" | "));
+      await page.click(".merge-modal .recover-create");
+      await waitIdle(page);
+      const pieces = (await store15(order)).filter((p) => p.id !== "r9101");
+      const uiOrders = await columnValues(page, "unscheduled-board", "生产单号");
+      const i2 = uiOrders.indexOf(order);
+      check("补建：新建了拆出的记录（数量 = 分拆差量），在原机床、紧跟原记录", pieces.length === 2 && pieces.some((p) => p.qty === before - 100 && p.pre === before - 100) && pieces.every((p) => p.machine === pieces[0].machine) && uiOrders[i2 + 1] === order && /已补建/.test(await notice15()), `${JSON.stringify(pieces.map((p) => [p.qty, p.pre]))}；${await notice15()}`);
+    });
+
+    await step15("15c 撤销分拆", async () => {
+      await clickCard(page, "覆膜");
+      const order = (await columnValues(page, "unscheduled-board", "生产单号")).filter((o, i, list) => list.indexOf(o) === list.lastIndexOf(o))[0];
+      const pre = await page.evaluate((o) => {
+        const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o);
+        const value = Number(r.c_qty);
+        r.c_pre = String(value); r.c_qty = String(value - 30);
+        return value;
+      }, order);
+      await refresh15();
+      const idx = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(order);
+      await page.locator(".unscheduled-board .schedule-row").nth(idx).locator(".merge-icon").click();
+      await page.waitForSelector(".merge-modal .recover-undo");
+      await page.click(".merge-modal .recover-undo");
+      await waitIdle(page);
+      const pieces = await store15(order);
+      const idx2 = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(order);
+      const mergeLeft = await page.locator(".unscheduled-board .schedule-row").nth(idx2).locator(".merge-icon").count();
+      check("撤销分拆：排程量恢复为拆前数量，合并按钮消失", pieces.length === 1 && pieces[0].qty === pre && mergeLeft === 0 && /已撤销分拆/.test(await notice15()), `${JSON.stringify(pieces.map((p) => [p.qty, p.pre]))}；${await notice15()}`);
+    });
+    check("页面无脚本错误（分拆新建/补建/撤销）", page.__errors.length === 0, page.__errors.join(" | "));
+    await page.screenshot({ path: path.join(__dirname, "shot-split.png") });
+  }
   await page.close();
 
   const failed = results.filter((r) => !r.ok);
