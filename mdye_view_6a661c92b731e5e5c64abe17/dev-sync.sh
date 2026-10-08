@@ -28,15 +28,23 @@ echo "自动同步已开启：每 ${INTERVAL} 秒检查一次新代码，有更�
 echo "  $PLUGIN_DIR"
 echo "保持这个窗口开着；按 Control + C 停止。"
 
+backed_up_for=""
 while true; do
   if git fetch -q --depth 20 origin "$BRANCH" 2>/dev/null; then
     latest=$(git rev-parse "origin/$BRANCH")
     synced=$(cat "$PLUGIN_DIR/.synced-commit" 2>/dev/null)
     if [ "$latest" != "$synced" ]; then
       git reset -q --hard "origin/$BRANCH"
-      backup="$PLUGIN_DIR/.backup/$(date +%Y%m%d-%H%M%S)"
-      mkdir -p "$backup" && cp -R "$PLUGIN_DIR/src" "$PLUGIN_DIR/.config" "$backup/" 2>/dev/null
-      rsync -a "$SUBDIR/src/" "$PLUGIN_DIR/src/" && rsync -a "$SUBDIR/.config/" "$PLUGIN_DIR/.config/" || { echo "覆盖失败，稍后重试"; sleep "$INTERVAL"; continue; }
+      # 每个新版本只备份一次本地原文件
+      if [ "$backed_up_for" != "$latest" ]; then
+        backup="$PLUGIN_DIR/.backup/$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$backup" && cp -R "$PLUGIN_DIR/src" "$PLUGIN_DIR/.config" "$backup/" 2>/dev/null
+        backed_up_for="$latest"
+      fi
+      mkdir -p "$PLUGIN_DIR/src" "$PLUGIN_DIR/.config"
+      if ! cp -R "$SUBDIR/src/." "$PLUGIN_DIR/src/" || ! cp -R "$SUBDIR/.config/." "$PLUGIN_DIR/.config/"; then
+        echo "覆盖失败，稍后重试"; sleep "$INTERVAL"; continue
+      fi
       echo "$latest" > "$PLUGIN_DIR/.synced-commit"
       echo "[$(date +%H:%M:%S)] 已更新到 ${latest:0:7}：$(git log -1 --pretty=%s)"
       echo "           → 刷新明道页面（Command + Shift + R）即可测试"
