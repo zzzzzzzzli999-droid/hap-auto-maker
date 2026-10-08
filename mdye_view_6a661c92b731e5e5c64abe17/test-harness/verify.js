@@ -612,6 +612,31 @@ async function waitIdle(page, timeout = 20000) {
   await page.screenshot({ path: path.join(__dirname, "shot-change.png") });
   await page.close();
 
+  // ---------- 10. “后道机床”为关联记录字段时：更换机床 / 合并机床写入格式正确 ----------
+  page = await open(browser, "latency=300&relation=1");
+  const relMachine = (order) => page.evaluate((o) => { const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o); const items = JSON.parse(r.c_machine); return { name: items[0].name, sid: items[0].sid, expected: window.__mock.machineSid(items[0].name) }; }, order);
+  check("关联记录模式：卡片仍按机床名显示", Boolean((await cardsOf(page)).flatMap((g) => g.cards).find((c) => c.name === "覆膜")));
+  await clickCard(page, "覆膜");
+  const relOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[0];
+  await page.locator(".unscheduled-board .schedule-row").first().locator(".check-cell input").check();
+  await page.click(".unscheduled-board .change-machine-trigger");
+  await page.selectOption(".machine-change-modal select", "上油");
+  await page.click(".machine-change-modal .primary");
+  await waitIdle(page);
+  const relAfter = await relMachine(relOrder);
+  const relNotice = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
+  check("更换机床：按关联记录格式写入（sid 为“上油”记录），没有报参数格式错误", relAfter.name === "上油" && relAfter.sid === relAfter.expected && !/失败|错误/.test(relNotice), `${JSON.stringify(relAfter)}；${relNotice}`);
+  await clickCard(page, "贴面机");
+  const tieOrders = await columnValues(page, "unscheduled-board", "生产单号");
+  await page.click(".merge-machine-trigger");
+  await page.selectOption(".machine-merge-modal select", { label: "上油" });
+  await page.click(".machine-merge-modal .primary");
+  await waitIdle(page);
+  const tieAfter = await Promise.all(tieOrders.map((o) => relMachine(o)));
+  check("合并机床：按关联记录格式写入", tieAfter.every((m) => m.name === "上油" && m.sid === m.expected), JSON.stringify(tieAfter.map((m) => m.name)));
+  check("页面无脚本错误（关联记录模式）", page.__errors.filter((e) => !/参数格式错误/.test(e)).length === 0, page.__errors.join(" | "));
+  await page.close();
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} passed`);
   await browser.close();

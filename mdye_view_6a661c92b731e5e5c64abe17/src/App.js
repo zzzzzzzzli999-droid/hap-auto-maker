@@ -480,10 +480,27 @@ function getPushUniqueId() {
     (window.md.global.Config.pushUniqueId || window.md.global.Config.PushUniqueId) || "";
 }
 
+// 写入关联记录 / 选项等字段时，优先复用“明道里已经是这个值的记录”的原始值：
+// 后道机床、工序可能是关联记录字段（值为 [{sid,name,...}] 的 JSON），按文字写入会报“参数格式错误”。
+// 只取未被本地乐观更新改动过的记录（__sig 非空），其原始值一定与显示值对应。
+function encodeLikeRows(control, displayValue, rows, rowKey) {
+  if (!control) return displayValue;
+  const sample = (rows || []).find((row) => row.__sig && row[rowKey] === displayValue && row.__raw
+    && row.__raw[control.controlId] !== undefined && row.__raw[control.controlId] !== null && row.__raw[control.controlId] !== "");
+  if (sample) {
+    const raw = sample.__raw[control.controlId];
+    return typeof raw === "string" ? raw : JSON.stringify(raw);
+  }
+  if ([29, 35].includes(Number(control.type))) {
+    throw new Error(`${control.controlName || "该字段"}是关联记录字段，当前数据里没有可参考的“${displayValue}”记录`);
+  }
+  return encodeValue(control, displayValue);
+}
+
 function encodeValue(control, displayValue) {
   if (!control) return displayValue;
   const controlType = Number(control.type);
-  if (controlType === 11 || controlType === 10) {
+  if (controlType === 11 || controlType === 10 || controlType === 9) {
     const option = controlOptions(control).find((item) =>
       item.value === displayValue || item.label === displayValue || item.key === displayValue
     );
@@ -1372,7 +1389,7 @@ export default function App() {
     setMachineChange(null);
     if (!picked.length) return;
     let encodedMachine;
-    try { encodedMachine = encodeValue(machineControl, target); }
+    try { encodedMachine = encodeLikeRows(machineControl, target, rows, "machine"); }
     catch (error) { setNotice(`更换机床失败：${error.message}`); return; }
     const optimistic = applyOptimistic(new Map(picked.map((row) => [row.rowid, { machine: target }])));
     const pickedIds = new Set(picked.map((row) => row.rowid));
@@ -1415,7 +1432,7 @@ export default function App() {
       return;
     }
     let encodedMachine;
-    try { encodedMachine = encodeValue(machineControl, targetMachine.name); }
+    try { encodedMachine = encodeLikeRows(machineControl, targetMachine.name, rows, "machine"); }
     catch (error) { setNotice(`合并机床失败：${error.message}`); return; }
     // 先切到目标机床并改好界面，后台再逐条写入机床字段。
     const optimistic = applyOptimistic(new Map(sourceRows.map((row) => [row.rowid, { machine: targetMachine.name }])));
@@ -1542,8 +1559,8 @@ export default function App() {
       const previous = previousMap.get(row.rowid) || {};
       const controls = [];
       if (row.status !== previous.status) controls.push({ ...statusControl, value: encodeValue(statusControl, row.status) });
-      if (row.process !== previous.process) controls.push({ ...processControl, value: encodeValue(processControl, row.process) });
-      if (row.machine !== previous.machine) controls.push({ ...machineControl, value: encodeValue(machineControl, row.machine) });
+      if (row.process !== previous.process) controls.push({ ...processControl, value: encodeLikeRows(processControl, row.process, rowsRef.current, "process") });
+      if (row.machine !== previous.machine) controls.push({ ...machineControl, value: encodeLikeRows(machineControl, row.machine, rowsRef.current, "machine") });
       if (Number(row.sequence) !== Number(previous.sequence)) controls.push({ ...sequenceControl, value: encodeValue(sequenceControl, row.sequence) });
       if (startTimeControl && row.scheduleStartTime !== previous.scheduleStartTime) controls.push({ ...startTimeControl, value: encodeValue(startTimeControl, row.scheduleStartTime) });
       if (endTimeControl && row.scheduleEndTime !== previous.scheduleEndTime) controls.push({ ...endTimeControl, value: encodeValue(endTimeControl, row.scheduleEndTime) });

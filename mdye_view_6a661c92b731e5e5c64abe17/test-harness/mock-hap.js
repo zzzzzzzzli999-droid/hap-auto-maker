@@ -4,6 +4,10 @@
   const params = new URLSearchParams(location.search);
   const LATENCY = Number(params.get("latency") || 600);
   const ROW_SCALE = Number(params.get("scale") || 1);
+  // relation=1：“后道机床”模拟为关联记录字段（type 29），值为 [{sid,name,sourcevalue}] 的 JSON；写入格式不对时按明道返回“参数格式错误”
+  const RELATION_MACHINE = params.get("relation") === "1";
+  const machineSid = (name) => "m_" + Array.from(name).reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(16);
+  const machineValue = (name) => RELATION_MACHINE ? JSON.stringify([{ sid: machineSid(name), name, sourcevalue: JSON.stringify({ rowid: machineSid(name), 机床名称: name }) }]) : name;
 
   const STATUS_OPTIONS = [
     { key: "k_queued", value: "已排序" },
@@ -12,7 +16,7 @@
   ];
   const controls = [
     { controlId: "c_process", controlName: "工序", type: 2 },
-    { controlId: "c_machine", controlName: "机床", type: 2 },
+    { controlId: "c_machine", controlName: RELATION_MACHINE ? "后道机床" : "机床", type: RELATION_MACHINE ? 29 : 2 },
     { controlId: "c_mseq", controlName: "机床序号", type: 6 },
     { controlId: "c_status", controlName: "排程状态", type: 11, options: STATUS_OPTIONS },
     { controlId: "c_seq", controlName: "排程序号", type: 6 },
@@ -73,7 +77,7 @@
       const rowid = `r${String(id).padStart(4, "0")}`;
       const qty = 300 + (id * 37) % 900;
       store.set(rowid, {
-        rowid, c_process: process, c_machine: machine, c_mseq: String(mseq),
+        rowid, c_process: process, c_machine: machineValue(machine), c_mseq: String(mseq),
         c_status: JSON.stringify([status]), c_seq: String(seq), c_qty: String(qty), c_pre: String(qty), c_ok: "0",
         c_customer: CUSTOMERS[id % CUSTOMERS.length], c_order: `X2609${String(10000 + id)}`, c_code: `A${100 + id % 400}-${String(id).padStart(3, "0")}A`,
         c_name: ["320g大青盐加碘纸箱", "2.25kg餐饮原味", "160g番茄火锅", "周转箱", "300g精制湖盐"][id % 5], c_size: `${400 + (id * 7) % 60}*${300 + id % 3 * 10}*180`,
@@ -87,7 +91,7 @@
   });
 
   const calls = [];
-  window.__mock = { store, calls, failNext: 0, failDeleteNext: 0, latency: LATENCY, inflight: 0 };
+  window.__mock = { machineSid, store, calls, failNext: 0, failDeleteNext: 0, latency: LATENCY, inflight: 0 };
   const delay = (value) => new Promise((resolve, reject) => {
     window.__mock.inflight += 1;
     setTimeout(() => {
@@ -108,6 +112,13 @@
     if (action === "updateWorksheetRow") {
       const row = store.get(data.rowId);
       if (!row) return new Error("记录不存在");
+      if (RELATION_MACHINE) {
+        const bad = data.newOldControl.find((control) => {
+          if (control.controlId !== "c_machine") return false;
+          try { const items = JSON.parse(control.value); return !Array.isArray(items) || !items.length || !items.every((item) => item && item.sid); } catch (_) { return true; }
+        });
+        if (bad) return new Error("字段“后道机床”的参数格式错误");
+      }
       data.newOldControl.forEach((control) => { row[control.controlId] = control.value; });
       return { data: { ...row }, resultCode: 1 };
     }
