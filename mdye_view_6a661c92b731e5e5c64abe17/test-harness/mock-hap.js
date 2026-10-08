@@ -4,10 +4,19 @@
   const params = new URLSearchParams(location.search);
   const LATENCY = Number(params.get("latency") || 600);
   const ROW_SCALE = Number(params.get("scale") || 1);
-  // relation=1：“后道机床”模拟为关联记录字段（type 29），值为 [{sid,name,sourcevalue}] 的 JSON；写入格式不对时按明道返回“参数格式错误”
+  // relation=1：“后道机床”模拟为关联记录字段（type 29，dataSource 指向“机床设置”表 ws_machine）。
+  // 读出的值带 sourcevalue（JSON 字符串）等额外内容；写入必须是明道前端的格式 [{name, sid(uuid), sourcevalue:false}]，
+  // 否则返回“字段‘后道机床’的参数格式错误”（与真实明道一致）。
   const RELATION_MACHINE = params.get("relation") === "1";
-  const machineSid = (name) => "m_" + Array.from(name).reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(16);
-  const machineValue = (name) => RELATION_MACHINE ? JSON.stringify([{ sid: machineSid(name), name, sourcevalue: JSON.stringify({ rowid: machineSid(name), 机床名称: name }) }]) : name;
+  const hex = (name, seed) => Array.from(name).reduce((h, c) => (h * 31 + c.charCodeAt(0) + seed) >>> 0, 7 + seed).toString(16).padStart(8, "0").slice(0, 8);
+  const machineSid = (name) => `${hex(name, 1)}-${hex(name, 2).slice(0, 4)}-4${hex(name, 3).slice(0, 3)}-8${hex(name, 4).slice(0, 3)}-${hex(name, 5)}${hex(name, 6).slice(0, 4)}`;
+  const machineValue = (name) => RELATION_MACHINE ? JSON.stringify([{ sid: machineSid(name), name, sourcevalue: JSON.stringify({ rowid: machineSid(name), m_name: name }), row: { rowid: machineSid(name) } }]) : name;
+  // “机床设置”表：机床名称（标题字段）+ 工序；含一台目前没有任务的机床“新覆膜机”
+  const MACHINE_TABLE = [["大五色印刷+上油", "表面处理"], ["覆膜", "表面处理"], ["上油", "表面处理"], ["贴面机", "表面处理"], ["新覆膜机", "表面处理"],
+    ["大五色印刷", "印刷"], ["大五色印刷+圆模", "印刷"], ["联动线印刷+开槽", "印刷"], ["联动线印刷+圆模", "印刷"], ["联动线无印刷+开槽", "印刷"],
+    ["联动线开槽", "模切"], ["平模机", "模切"], ["碰线", "碰线"], ["新碰线+喷码", "碰线"]];
+  const MACHINE_CONTROLS = [{ controlId: "m_name", controlName: "机床名称", type: 2, attribute: 1 }, { controlId: "m_process", controlName: "工序", type: 2, attribute: 0 }];
+  const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ""));
 
   const STATUS_OPTIONS = [
     { key: "k_queued", value: "已排序" },
@@ -16,7 +25,9 @@
   ];
   const controls = [
     { controlId: "c_process", controlName: "工序", type: 2 },
-    { controlId: "c_machine", controlName: RELATION_MACHINE ? "后道机床" : "机床", type: RELATION_MACHINE ? 29 : 2 },
+    RELATION_MACHINE
+      ? { controlId: "c_machine", controlName: "后道机床", type: 29, dataSource: "ws_machine", enumDefault: 1, advancedSetting: { showtype: "3" } }
+      : { controlId: "c_machine", controlName: "机床", type: 2 },
     { controlId: "c_mseq", controlName: "机床序号", type: 6 },
     { controlId: "c_status", controlName: "排程状态", type: 11, options: STATUS_OPTIONS },
     { controlId: "c_seq", controlName: "排程序号", type: 6 },
@@ -103,6 +114,8 @@
 
   function handle(controller, action, data) {
     calls.push({ t: performance.now(), controller, action, data: JSON.parse(JSON.stringify(data || {})) });
+    if (action === "getFilterRows" && data.worksheetId === "ws_machine") return { data: MACHINE_TABLE.map(([name, process]) => ({ rowid: machineSid(name), m_name: name, m_process: process })), resultCode: 1 };
+    if (action === "getWorksheetControls" && data.worksheetId === "ws_machine") return { data: { controls: MACHINE_CONTROLS }, resultCode: 1 };
     if (action === "getFilterRows") return { data: Array.from(store.values()).map((row) => ({ ...row })), resultCode: 1 };
     if (action === "getWorksheetControls") return { data: { controls }, resultCode: 1 };
     if (action === "getWorksheetBtns") return [{ btnId: "b_split", name: "分拆" }, { btnId: "b_merge", name: "合并" }, { btnId: "b_confirm", name: "确定排程" }];
@@ -120,7 +133,11 @@
       if (RELATION_MACHINE) {
         const bad = data.newOldControl.find((control) => {
           if (control.controlId !== "c_machine") return false;
-          try { const items = JSON.parse(control.value); return !Array.isArray(items) || !items.length || !items.every((item) => item && item.sid); } catch (_) { return true; }
+          try {
+            const items = JSON.parse(control.value);
+            return !Array.isArray(items) || !items.length || !items.every((item) => item && isUuid(item.sid)
+              && Object.keys(item).every((key) => ["name", "sid", "sourcevalue"].includes(key)) && (item.sourcevalue === undefined || item.sourcevalue === false));
+          } catch (_) { return true; }
         });
         if (bad) return new Error("字段“后道机床”的参数格式错误");
       }

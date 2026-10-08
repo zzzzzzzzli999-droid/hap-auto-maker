@@ -485,6 +485,60 @@ function getPushUniqueId() {
     (window.md.global.Config.pushUniqueId || window.md.global.Config.PushUniqueId) || "";
 }
 
+// ---- 关联记录字段（如“后道机床”关联“机床设置”表）----
+// 关联的表从字段配置 control.dataSource 读取，不写死任何 ID，换表/换视图可复用。
+// 写入格式与明道前端（pd-openweb formatControlToServer）一致：[{ name, sid: 被关联记录rowid, sourcevalue: false }]；
+// 直接回写读取到的原始值（带 sourcevalue 字符串等）会被明道拒绝：“字段‘后道机床’的参数格式错误”。
+function isRelationControl(control) {
+  return Boolean(control) && Number(control.type) === 29;
+}
+
+function relationWriteValue(sid, name) {
+  return JSON.stringify([{ name, sid, sourcevalue: false }]);
+}
+
+// 从任务记录里已有的关联值中，找出某个名称对应的被关联记录 rowid
+function relationSidFromRows(control, name, rows) {
+  for (const row of rows || []) {
+    const raw = row.__sig && row.__raw ? row.__raw[control.controlId] : null;
+    if (!raw) continue;
+    let items;
+    try { items = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) { continue; }
+    if (!Array.isArray(items)) continue;
+    const hit = items.find((item) => item && item.sid && (item.name || item.label || item.value) === name);
+    if (hit) return hit.sid;
+  }
+  return "";
+}
+
+async function fetchControlsOf(payload) {
+  const request = { ...payload, getTemplate: true, handControlSource: true, resultType: 1 };
+  if (typeof runtimeApi.getWorksheetControls === "function") return runtimeApi.getWorksheetControls(request);
+  if (typeof worksheetApi.getWorksheetControls === "function") return worksheetApi.getWorksheetControls(request);
+  if (window.api && typeof window.api.call === "function") return window.api.call("worksheet", "getWorksheetControls", request);
+  throw new Error("getWorksheetControls API unavailable");
+}
+
+// 读取关联字段所关联表的全部记录：{ rowid, name(标题字段), texts(各字段显示值) }
+async function loadRelationRecords(control, appId) {
+  const sheetId = control && control.dataSource;
+  if (!sheetId) return [];
+  const [controlsResponse, rowsResponse] = await Promise.all([
+    fetchControlsOf(compact({ appId, worksheetId: sheetId })).catch(() => null),
+    getRows(compact({ appId, worksheetId: sheetId, pageIndex: 1, pageSize: 1000, notGetTotal: true })).catch(() => null)
+  ]);
+  const controls = extractControls(controlsResponse);
+  const titleControl = controls.find((item) => Number(item.attribute) === 1);
+  return extractRows(rowsResponse).map((raw) => {
+    const texts = controls.map((item) => String(decodeOption(raw[item.controlId], item) || "").trim()).filter(Boolean);
+    return {
+      rowid: raw.rowid || raw.rowId,
+      name: titleControl ? String(decodeOption(raw[titleControl.controlId], titleControl) || "").trim() : "",
+      texts
+    };
+  }).filter((record) => record.rowid && record.name);
+}
+
 // 写入关联记录 / 选项等字段时，优先复用“明道里已经是这个值的记录”的原始值：
 // 后道机床、工序可能是关联记录字段（值为 [{sid,name,...}] 的 JSON），按文字写入会报“参数格式错误”。
 // 只取未被本地乐观更新改动过的记录（__sig 非空），其原始值一定与显示值对应。
@@ -1374,6 +1428,30 @@ export default function App() {
     setSelectedRowIds((current) => current.length ? [] : current);
   };
 
+  // “后道机床”为关联记录时，读取它关联的表（如“机床设置”）的全部机床：用于更换机床的可选项和写入的记录 ID
+  const [relationRecords, setRelationRecords] = useState({});
+  const machineControlForRelation = resolveField("machine");
+  const machineRelationSheet = isRelationControl(machineControlForRelation) ? machineControlForRelation.dataSource : "";
+  useEffect(() => {
+    if (!machineRelationSheet || relationRecords[machineControlForRelation.controlId]) return;
+    let cancelled = false;
+    loadRelationRecords(machineControlForRelation, appId).then((records) => {
+      if (!cancelled) setRelationRecords((current) => ({ ...current, [machineControlForRelation.controlId]: records }));
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [machineRelationSheet, appId]);
+
+  // 字段写入值：关联记录 → 用关联表里的记录 ID（找不到再从任务已有关联值里找）；其他类型沿用 encodeLikeRows
+  const encodeFieldValue = (control, name, rowKey) => {
+    if (isRelationControl(control)) {
+      const record = (relationRecords[control.controlId] || []).find((item) => item.name === name);
+      const sid = (record && record.rowid) || relationSidFromRows(control, name, rowsRef.current);
+      if (!sid) throw new Error(`在“${control.controlName || "关联字段"}”关联的表中找不到“${name}”`);
+      return relationWriteValue(sid, name);
+    }
+    return encodeLikeRows(control, name, rowsRef.current, rowKey);
+  };
+
   // 每个工序下有哪些机床（按机床序号、名称排列），用于“更换机床”只能选同工序的机床
   const machinesByProcess = useMemo(() => {
     const byProcess = new Map();
@@ -1386,6 +1464,17 @@ export default function App() {
     return new Map(Array.from(byProcess.entries()).map(([process, machines]) => [process,
       Array.from(machines.entries()).sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0], "zh-CN", { numeric: true })).map(([name]) => name)]));
   }, [machineGroupSignature]);
+
+  // 同工序可选机床：任务数据里出现过的 + 关联表（机床设置）里工序相同的机床（含暂时没有任务的）
+  const machineOptionsFor = (process) => {
+    const fromRows = machinesByProcess.get(process) || [];
+    const machineControl = resolveField("machine");
+    const fromTable = ((machineControl && relationRecords[machineControl.controlId]) || [])
+      .filter((record) => record.texts.includes(process) && !fromRows.includes(record.name))
+      .map((record) => record.name)
+      .sort((a, b) => a.localeCompare(b, "zh-CN", { numeric: true }));
+    return [...fromRows, ...fromTable];
+  };
 
   // 更换机床：把当前栏里勾选的任务换到同工序的另一台机床，工序、状态、排程顺序不变。
   const openMachineChange = (lane) => {
@@ -1400,7 +1489,7 @@ export default function App() {
       setNotice(`勾选的任务属于不同工序（${processes.join("、")}），请按工序分别更换`);
       return;
     }
-    const options = (machinesByProcess.get(processes[0]) || []).filter((name) => picked.some((row) => row.machine !== name));
+    const options = machineOptionsFor(processes[0]).filter((name) => picked.some((row) => row.machine !== name));
     if (!options.length) {
       setNotice(`工序“${processes[0]}”下没有其他机床可更换`);
       return;
@@ -1420,7 +1509,7 @@ export default function App() {
     setMachineChange(null);
     if (!picked.length) return;
     let encodedMachine;
-    try { encodedMachine = encodeLikeRows(machineControl, target, rows, "machine"); }
+    try { encodedMachine = encodeFieldValue(machineControl, target, "machine"); }
     catch (error) { setNotice(`更换机床失败：${error.message}`); return; }
     const optimistic = applyOptimistic(new Map(picked.map((row) => [row.rowid, { machine: target }])));
     const pickedIds = new Set(picked.map((row) => row.rowid));
@@ -1463,7 +1552,7 @@ export default function App() {
       return;
     }
     let encodedMachine;
-    try { encodedMachine = encodeLikeRows(machineControl, targetMachine.name, rows, "machine"); }
+    try { encodedMachine = encodeFieldValue(machineControl, targetMachine.name, "machine"); }
     catch (error) { setNotice(`合并机床失败：${error.message}`); return; }
     // 先切到目标机床并改好界面，后台再逐条写入机床字段。
     const optimistic = applyOptimistic(new Map(sourceRows.map((row) => [row.rowid, { machine: targetMachine.name }])));
@@ -1591,8 +1680,8 @@ export default function App() {
       const previous = previousMap.get(row.rowid) || {};
       const controls = [];
       if (row.status !== previous.status) controls.push({ ...statusControl, value: encodeValue(statusControl, row.status) });
-      if (row.process !== previous.process) controls.push({ ...processControl, value: encodeLikeRows(processControl, row.process, rowsRef.current, "process") });
-      if (row.machine !== previous.machine) controls.push({ ...machineControl, value: encodeLikeRows(machineControl, row.machine, rowsRef.current, "machine") });
+      if (row.process !== previous.process) controls.push({ ...processControl, value: encodeFieldValue(processControl, row.process, "process") });
+      if (row.machine !== previous.machine) controls.push({ ...machineControl, value: encodeFieldValue(machineControl, row.machine, "machine") });
       if (Number(row.sequence) !== Number(previous.sequence)) controls.push({ ...sequenceControl, value: encodeValue(sequenceControl, row.sequence) });
       if (startTimeControl && row.scheduleStartTime !== previous.scheduleStartTime) controls.push({ ...startTimeControl, value: encodeValue(startTimeControl, row.scheduleStartTime) });
       if (endTimeControl && row.scheduleEndTime !== previous.scheduleEndTime) controls.push({ ...endTimeControl, value: encodeValue(endTimeControl, row.scheduleEndTime) });
@@ -2292,7 +2381,7 @@ export default function App() {
       {machineChange && (() => {
         const picked = rows.filter((row) => machineChange.rowIds.includes(row.rowid));
         const current = Array.from(picked.reduce((map, row) => map.set(row.machine, (map.get(row.machine) || 0) + 1), new Map()).entries());
-        const options = (machinesByProcess.get(machineChange.process) || []).filter((name) => picked.some((row) => row.machine !== name));
+        const options = machineOptionsFor(machineChange.process).filter((name) => picked.some((row) => row.machine !== name));
         return <div className="modal-backdrop" onMouseDown={() => setMachineChange(null)}><div className="split-modal machine-change-modal" onMouseDown={(event) => event.stopPropagation()}>
           <div className="modal-title">更换机床</div>
           <p className="modal-record">{machineChange.lane === "queued" ? "未排程" : "已排程"}中勾选的 {picked.length} 条任务</p>

@@ -612,20 +612,36 @@ async function waitIdle(page, timeout = 20000) {
   await page.screenshot({ path: path.join(__dirname, "shot-change.png") });
   await page.close();
 
-  // ---------- 10. “后道机床”为关联记录字段时：更换机床 / 合并机床写入格式正确 ----------
+  // ---------- 10. “后道机床”为关联记录字段（关联“机床设置”表）：更换机床 / 合并机床 ----------
   page = await open(browser, "latency=300&relation=1");
-  const relMachine = (order) => page.evaluate((o) => { const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o); const items = JSON.parse(r.c_machine); return { name: items[0].name, sid: items[0].sid, expected: window.__mock.machineSid(items[0].name) }; }, order);
+  const relMachine = (order) => page.evaluate((o) => {
+    const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o);
+    const items = JSON.parse(r.c_machine);
+    return { name: items[0].name, sid: items[0].sid, expected: window.__mock.machineSid(items[0].name) };
+  }, order);
   check("关联记录模式：卡片仍按机床名显示", Boolean((await cardsOf(page)).flatMap((g) => g.cards).find((c) => c.name === "覆膜")));
   await clickCard(page, "覆膜");
-  const relOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[0];
-  await page.locator(".unscheduled-board .schedule-row").first().locator(".check-cell input").check();
+  const relOrders = (await columnValues(page, "unscheduled-board", "生产单号")).slice(0, 2);
+  await page.locator(".unscheduled-board .schedule-row").nth(0).locator(".check-cell input").check();
   await page.click(".unscheduled-board .change-machine-trigger");
+  await page.waitForSelector(".machine-change-modal");
+  const relOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value));
+  check("更换机床下拉框来自“机床设置”表的同工序机床（含暂无任务的“新覆膜机”，不含其他工序）", JSON.stringify(relOptions.slice().sort()) === JSON.stringify(["上油", "大五色印刷+上油", "新覆膜机", "贴面机"].sort()), relOptions.join("、"));
   await page.selectOption(".machine-change-modal select", "上油");
   await page.click(".machine-change-modal .primary");
   await waitIdle(page);
-  const relAfter = await relMachine(relOrder);
+  const relAfter = await relMachine(relOrders[0]);
   const relNotice = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
-  check("更换机床：按关联记录格式写入（sid 为“上油”记录），没有报参数格式错误", relAfter.name === "上油" && relAfter.sid === relAfter.expected && !/失败|错误/.test(relNotice), `${JSON.stringify(relAfter)}；${relNotice}`);
+  check("更换机床：按明道前端格式写入关联记录（sid = 机床设置表中“上油”的记录 ID），不报参数格式错误", relAfter.name === "上油" && relAfter.sid === relAfter.expected && !/失败|错误/.test(relNotice), `${JSON.stringify(relAfter)}；${relNotice}`);
+  // 换到一台目前没有任何任务的机床
+  await clickCard(page, "覆膜");
+  await page.locator(".unscheduled-board .schedule-row").nth(0).locator(".check-cell input").check();
+  await page.click(".unscheduled-board .change-machine-trigger");
+  await page.selectOption(".machine-change-modal select", "新覆膜机");
+  await page.click(".machine-change-modal .primary");
+  await waitIdle(page);
+  const newMachine = await relMachine(relOrders[1]);
+  check("可以换到暂无任务的机床“新覆膜机”（记录 ID 取自机床设置表）", newMachine.name === "新覆膜机" && newMachine.sid === newMachine.expected && Boolean((await cardsOf(page)).flatMap((g) => g.cards).find((c) => c.name === "新覆膜机")), JSON.stringify(newMachine));
   await clickCard(page, "贴面机");
   const tieOrders = await columnValues(page, "unscheduled-board", "生产单号");
   await page.click(".merge-machine-trigger");
