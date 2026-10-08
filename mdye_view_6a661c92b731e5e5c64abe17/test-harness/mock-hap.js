@@ -10,6 +10,14 @@
   const RELATION_MACHINE = params.get("relation") === "1";
   const hex = (name, seed) => Array.from(name).reduce((h, c) => (h * 31 + c.charCodeAt(0) + seed) >>> 0, 7 + seed).toString(16).padStart(8, "0").slice(0, 8);
   const machineSid = (name) => `${hex(name, 1)}-${hex(name, 2).slice(0, 4)}-4${hex(name, 3).slice(0, 3)}-8${hex(name, 4).slice(0, 3)}-${hex(name, 5)}${hex(name, 6).slice(0, 4)}`;
+  // 排程汇总表：关联“排程汇总”表（ws_summary）的字段，确定排程工作流生成汇总记录并关联到每条明细。
+  // summarycount=1：视图数据里该字段只返回数量（不带关联值），插件需向明道查明细的关联记录。nosummary=1：表里没有这个字段。
+  const SUMMARY_COUNT = params.get("summarycount") === "1";
+  const NO_SUMMARY = params.get("nosummary") === "1";
+  // splitmachine=打包：模拟“分拆”工作流把新记录建在别的机床上（插件应改回原记录的机床）
+  const SPLIT_MACHINE = params.get("splitmachine") || "";
+  const summarySid = (no) => machineSid(`汇总:${no}`);
+  const summaryValue = (no) => no ? JSON.stringify([{ sid: summarySid(no), name: no, sourcevalue: JSON.stringify({ rowid: summarySid(no), s_no: no }) }]) : "";
   const machineValue = (name) => RELATION_MACHINE ? JSON.stringify([{ sid: machineSid(name), name, sourcevalue: JSON.stringify({ rowid: machineSid(name), m_name: name }), row: { rowid: machineSid(name) } }]) : name;
   // “机床设置”表：机床名称（标题字段）+ 工序；含一台目前没有任务的机床“新覆膜机”
   const MACHINE_TABLE = [["大五色印刷+上油", "表面处理"], ["覆膜", "表面处理"], ["上油", "表面处理"], ["贴面机", "表面处理"], ["新覆膜机", "表面处理"],
@@ -51,7 +59,8 @@
     { controlId: "c_print", controlName: "印刷版", type: 2 },
     { controlId: "c_wa", controlName: "瓦量", type: 6 },
     { controlId: "c_change", controlName: "换版", type: 6 },
-    ...(params.get("nosno") === "1" ? [] : [{ controlId: "c_sno", controlName: "排程单号", type: 2 }])
+    ...(params.get("nosno") === "1" ? [] : [{ controlId: "c_sno", controlName: "排程单号", type: 2 }]),
+    ...(NO_SUMMARY ? [] : [{ controlId: "c_summary", controlName: "排程汇总表", type: 29, dataSource: "ws_summary", viewId: "view_summary", enumDefault: 1, advancedSetting: { showtype: "1" } }])
   ];
   window.env = {
     process: "c_process", machine: "c_machine", machineSequence: "c_mseq", scheduleStatus: "c_status",
@@ -90,7 +99,7 @@
       const qty = 300 + (id * 37) % 900;
       store.set(rowid, {
         rowid, c_process: process, c_machine: machineValue(machine), c_mseq: String(mseq),
-        c_status: JSON.stringify([status]), c_seq: String(seq), c_sno: status === "k_scheduled" ? `${process}20261001001` : "", c_qty: String(qty), c_pre: String(qty), c_ok: "0",
+        c_status: JSON.stringify([status]), c_seq: String(seq), c_sno: status === "k_scheduled" ? `${process}20261001001` : "", c_summary: status === "k_scheduled" ? summaryValue(`${process}20261001001`) : "", c_qty: String(qty), c_pre: String(qty), c_ok: "0",
         c_customer: CUSTOMERS[id % CUSTOMERS.length], c_order: `X2609${String(10000 + id)}`, c_code: `A${100 + id % 400}-${String(id).padStart(3, "0")}A`,
         c_name: ["320g大青盐加碘纸箱", "2.25kg餐饮原味", "160g番茄火锅", "周转箱", "300g精制湖盐"][id % 5], c_size: `${400 + (id * 7) % 60}*${300 + id % 3 * 10}*180`,
         c_req: String(qty), c_prod: String(qty), c_remark: "", c_start: "", c_end: "", c_rate: String(60 + id % 40),
@@ -103,33 +112,56 @@
   });
 
   const calls = [];
-  window.__mock = { machineSid, store, calls, failNext: 0, failDeleteNext: 0, latency: LATENCY, inflight: 0 };
+  window.__mock = {
+    machineSid, summarySid, store, calls, opened: [], failNext: 0, failDeleteNext: 0, latency: LATENCY, inflight: 0,
+    // 明道“拒绝保存”：接口不报错，正常返回失败结果（与真实明道一致，见 App.js assertRowSaved 注释）
+    rejectNext: [],         // updateWorksheetRow 依次返回 { data: null, resultCode, badData }
+    ignoreNext: 0,          // updateWorksheetRow 返回成功（resultCode 1），但记录什么都没改
+    deleteRejectNext: 0,    // deleteWorksheetRows 返回 { isSuccess: false }
+    processRejectNext: 0    // startProcess 返回 false（记录不满足执行条件或流程尚未启用）
+  };
+  // 表单业务规则（resultCode 32 时插件读取规则里的提示文字）
+  const RULES = [{ ruleId: "rule_lock", name: "已排程锁定机床", ruleItems: [{ type: 6, message: "已排程的任务不允许更换机床", controls: [{ controlId: "c_machine" }] }] }];
+  // 真实运行环境转交的接口异常是 { errorCode, errorMessage, errorData } 对象（不是 Error）
+  const exception = (message) => ({ __reject: { errorCode: 0, errorMessage: message, errorData: {} } });
   const delay = (value) => new Promise((resolve, reject) => {
     window.__mock.inflight += 1;
     setTimeout(() => {
       window.__mock.inflight -= 1;
-      if (value instanceof Error) reject(value); else resolve(value);
+      if (value && value.__reject) reject(value.__reject); else resolve(value);
     }, window.__mock.latency);
   });
+  const machineNameBySid = (sid) => (MACHINE_TABLE.find(([name]) => machineSid(name) === sid) || [])[0];
 
   function handle(controller, action, data) {
     calls.push({ t: performance.now(), controller, action, data: JSON.parse(JSON.stringify(data || {})) });
     if (action === "getFilterRows" && data.worksheetId === "ws_machine") return { data: MACHINE_TABLE.map(([name, process]) => ({ rowid: machineSid(name), m_name: name, m_process: process })), resultCode: 1 };
     if (action === "getWorksheetControls" && data.worksheetId === "ws_machine") return { data: { controls: MACHINE_CONTROLS }, resultCode: 1 };
-    if (action === "getFilterRows") return { data: Array.from(store.values()).map((row) => ({ ...row })), resultCode: 1 };
+    if (action === "getFilterRows") return { data: Array.from(store.values()).map((row) => ({ ...row, ...(SUMMARY_COUNT ? { c_summary: row.c_summary ? "1" : "0" } : {}) })), resultCode: 1 };
+    if (action === "getRowRelationRows") {
+      const row = store.get(data.rowId);
+      const items = row && row[data.controlId] ? JSON.parse(row[data.controlId]) : [];
+      return { data: items.map((item) => ({ rowid: item.sid, s_no: item.name })), count: items.length, resultCode: 1 };
+    }
     if (action === "getWorksheetControls") return { data: { controls }, resultCode: 1 };
     if (action === "getWorksheetBtns") return [{ btnId: "b_split", name: "分拆" }, { btnId: "b_merge", name: "合并" }, { btnId: "b_confirm", name: "确定排程" }];
+    if (action === "getControlRules") return RULES;
     if (window.__mock.failNext > 0 && (action === "updateWorksheetRow" || action === "startProcess")) {
       window.__mock.failNext -= 1;
-      return new Error("模拟网络错误");
+      return exception("模拟网络错误");
     }
     if (action === "updateWorksheetRow" && window.__mock.failControl && data.newOldControl.some((c) => c.controlId === window.__mock.failControl)) {
       window.__mock.failControl = "";
-      return new Error("模拟排程单号写入失败");
+      return exception("模拟排程单号写入失败");
     }
     if (action === "updateWorksheetRow") {
       const row = store.get(data.rowId);
-      if (!row) return new Error("记录不存在");
+      if (!row) return { data: null, resultCode: 4 };
+      if (window.__mock.rejectNext.length) {
+        const reject = window.__mock.rejectNext.shift();
+        return { data: null, resultCode: reject.resultCode, badData: reject.badData || [] };
+      }
+      if (window.__mock.ignoreNext > 0) { window.__mock.ignoreNext -= 1; return { data: { ...row }, resultCode: 1 }; }
       if (RELATION_MACHINE) {
         const bad = data.newOldControl.find((control) => {
           if (control.controlId !== "c_machine") return false;
@@ -139,32 +171,54 @@
               && Object.keys(item).every((key) => ["name", "sid", "sourcevalue"].includes(key)) && (item.sourcevalue === undefined || item.sourcevalue === false));
           } catch (_) { return true; }
         });
-        if (bad) return new Error("字段“后道机床”的参数格式错误");
+        if (bad) return exception("字段“后道机床”的参数格式错误");
       }
-      data.newOldControl.forEach((control) => { row[control.controlId] = control.value; });
+      data.newOldControl.forEach((control) => {
+        if (RELATION_MACHINE && control.controlId === "c_machine") {
+          // 明道按 sid 关联；关联表里没有这个 sid 时不会改（返回的记录里仍是原值）
+          const name = machineNameBySid(JSON.parse(control.value)[0].sid);
+          if (name) row.c_machine = machineValue(name);
+          return;
+        }
+        row[control.controlId] = control.value;
+      });
       return { data: { ...row }, resultCode: 1 };
     }
     if (action === "deleteWorksheetRows") {
-      if (window.__mock.failDeleteNext > 0) { window.__mock.failDeleteNext -= 1; return new Error("模拟删除失败"); }
+      if (window.__mock.failDeleteNext > 0) { window.__mock.failDeleteNext -= 1; return exception("模拟删除失败"); }
+      if (window.__mock.deleteRejectNext > 0) { window.__mock.deleteRejectNext -= 1; return { isSuccess: false }; }
       data.rowIds.forEach((rowId) => store.delete(rowId));
-      return { data: true };
+      return { isSuccess: true };
     }
     if (action === "startProcess") {
+      if (window.__mock.processRejectNext > 0) { window.__mock.processRejectNext -= 1; return false; }
       if (data.triggerId === "b_split") {
         const source = store.get(data.sources[0]);
         const out = Number((String(data.dataLog).match(/拆出数量：(\d+)/) || [])[1] || 0);
         id += 1;
         const rowid = `r${String(id).padStart(4, "0")}`;
-        store.set(rowid, { ...source, rowid, c_qty: String(out), c_pre: String(out) });
+        store.set(rowid, { ...source, rowid, c_qty: String(out), c_pre: String(out), ...(SPLIT_MACHINE ? { c_machine: machineValue(SPLIT_MACHINE) } : {}) });
+      }
+      if (data.triggerId === "b_confirm") {
+        // 确定排程工作流：按排程单号生成汇总记录并关联到每条明细
+        data.sources.forEach((rowId) => { const row = store.get(rowId); if (row) row.c_summary = summaryValue(row.c_sno); });
       }
       if (data.triggerId === "b_merge") {
         const source = store.get(data.sources[0]);
         source.c_qty = source.c_pre;
       }
-      return { data: true };
+      return true;
     }
     return { data: null };
   }
-  window.api = { call: (controller, action, data) => delay(handle(controller, action, data)) };
-  window.utils = { openRecordInfo: () => Promise.resolve() };
+  const call = (controller, action, data) => delay(handle(controller, action, data));
+  // 与真实明道插件运行环境（pd-openweb WidgetView）一致：window.api 上直接有这几个接口，其他主站接口走 window.api.call
+  window.api = {
+    call,
+    getFilterRows: (data) => call("worksheet", "getFilterRows", data),
+    updateWorksheetRow: (data) => call("worksheet", "updateWorksheetRow", data),
+    deleteWorksheetRow: (data) => call("worksheet", "deleteWorksheetRows", data),
+    getRowRelationRows: (data) => call("worksheet", "getRowRelationRows", data)
+  };
+  window.utils = { openRecordInfo: (args) => { window.__mock.opened.push(args); return Promise.resolve(); } };
 })();

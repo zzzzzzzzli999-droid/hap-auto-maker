@@ -61,9 +61,22 @@ button { color: inherit; }
 /* 更换机床：勾选任务后换到同工序的其他机床 */
 .change-machine-trigger { flex: none; height: 26px; padding: 0 10px; color: #1d5d86; border: 1px solid #8ebbd5; border-radius: 3px; background: #f5fbff; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
 .change-machine-trigger:hover, .change-machine-trigger:focus-visible { color: #fff; background: #2d86c3; border-color: #1d70aa; outline: none; }
+/* 打印排程表：打开已排程明细关联的排程汇总表 */
+.print-schedule-trigger { flex: none; height: 26px; padding: 0 10px; color: #5a3f99; border: 1px solid #b7a3dd; border-radius: 3px; background: #f7f3ff; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.print-schedule-trigger:hover, .print-schedule-trigger:focus-visible { color: #fff; background: #7356c2; border-color: #5d43a8; outline: none; }
+.print-schedule-trigger:disabled { cursor: not-allowed; opacity: .5; }
 .split-modal label strong.machine-change-current { max-width: 230px; overflow: hidden; color: #315c78; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.machine-change-orders { margin: -4px 0 4px; overflow: hidden; color: #5d7d93; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.split-modal select.unselected { color: #8aa3b5; }
+.modal-actions button:disabled { cursor: not-allowed; opacity: .5; }
 
 .notice { position: fixed; top: 8px; left: 50%; z-index: 200; max-width: min(680px, 70vw); padding: 6px 14px; overflow: hidden; color: #77521b; background: #fff5da; border: 1px solid #e4cf99; border-radius: 3px; box-shadow: 0 5px 16px rgba(89, 69, 30, .16); text-overflow: ellipsis; white-space: nowrap; font-size: 11px; pointer-events: none; transform: translateX(-50%); }
+/* 失败提示可换行显示完整原因；带按钮的提示（返回原机床）可点击 */
+.notice.notice-error { max-width: min(760px, 86vw); color: #8a2f2f; background: #fff0ee; border-color: #e7b1aa; white-space: normal; line-height: 1.6; }
+.notice.has-action { display: flex; align-items: center; gap: 10px; pointer-events: auto; }
+.notice.has-action > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.notice > button { flex: none; height: 22px; padding: 0 9px; color: #1d5d86; border: 1px solid #8ebbd5; border-radius: 3px; background: #fff; cursor: pointer; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.notice > button:hover { color: #fff; background: #2d86c3; border-color: #1d70aa; }
 .boards { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(280px, var(--left-width, 39%)) 8px minmax(280px, 1fr); grid-template-rows: minmax(0, 1fr); gap: 0; }
 .boards > .unscheduled-board { grid-column: 1; grid-row: 1; }
 .boards > .board-splitter { grid-column: 2; grid-row: 1; }
@@ -159,6 +172,10 @@ button { color: inherit; }
 .schedule-row:nth-child(even) { background: #edf6fb; }
 .schedule-row:hover { border-color: #75a9cf; background: #ddecff; box-shadow: none; }
 .schedule-row.selected, .schedule-row.selected:nth-child(even) { color: #0c4675; border-color: #4c98d7; background: #cfe7fb; box-shadow: inset 0 0 0 1px rgba(45, 127, 190, .18); }
+/* 更换机床后：被移动的记录黄色高亮约 6 秒，方便确认换到了哪里 */
+.schedule-row.row-flash, .schedule-row.row-flash:nth-child(even) { color: #5c4300; background: #fff1b8; border-color: #e0b43c; animation: row-flash 1.2s ease-in-out 3; }
+.schedule-row.row-flash .action-cell { background: #fff1b8; }
+@keyframes row-flash { 50% { background: #ffe07a; } }
 .scheduled-board .schedule-row.selected { border-left-color: #126fba; }
 .schedule-row:active { cursor: grabbing; }
 /* 分拆占位行：新记录生成前先显示，生成后自动替换 */

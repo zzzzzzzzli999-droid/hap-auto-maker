@@ -55,7 +55,9 @@ const FIELD_ALIASES = {
   processRequirement: ["processRequirement", "工艺要求"],
   processRemark: ["processRemark", "工艺备注"],
   productionRequirement: ["productionRequirement", "生产要求"],
-  scheduleSummary: ["scheduleSummary", "排程汇总表"]
+  // 排程汇总表：关联“排程汇总”表的字段（确定排程工作流生成汇总记录并关联到每条明细）。
+  // “打印排程表”按钮打开它关联的汇总记录；关联的表取字段配置 control.dataSource，不写死 ID。
+  scheduleSummary: ["scheduleSummary", "排程汇总表", "排程汇总"]
 };
 
 const STATUS = { queued: "已排序", scheduled: "已排程", produced: "已生产" };
@@ -92,6 +94,11 @@ function isVirtualRow(row) {
 
 function splitIdentity(row) {
   return `${row.process}|${row.machine}|${row.orderNo}|${row.productCode}|${row.productName}`;
+}
+
+// 同一订单、同一工序（不看机床）：用来认出“分拆”工作流新建的记录——即使工作流把它建在了别的机床上
+function splitOrderIdentity(row) {
+  return `${row.process}|${row.orderNo}|${row.productCode}|${row.productName}`;
 }
 
 // 乐观更新的字段比较：服务端返回值与本地补丁一致即视为保存成功。
@@ -396,19 +403,144 @@ async function ensureWorksheetControls(payload) {
   return fetchedControls;
 }
 
+// ---- 明道保存结果校验 ----
+// 明道拒绝保存（记录锁定、业务规则、必填、唯一、无权限等）时接口不会报错，而是正常返回“失败结果”，插件运行环境原样转交：
+//   updateWorksheetRow：成功 { data: 保存后的记录, resultCode: 1 }；失败 { data: null, resultCode: 4/6/7/11/22/31/32/72, badData }
+//   deleteWorksheetRow(s)：{ isSuccess: true/false }
+//   startProcess（自定义按钮触发工作流）：成功为真值；false/空 = 记录不满足执行条件或流程尚未启用
+// 判断方式与明道前端一致（pd-openweb：各视图 data && resultCode === 1、删除看 isSuccess、按钮 if (!data) 提示失败）。
+// 不检查返回值，就会把被明道拒绝的保存当成成功：界面显示已修改，明道里其实没有变。
+const RECORD_RESULT_TEXT = {
+  4: "记录已被删除",
+  6: "记录已锁定",
+  7: "没有权限修改这条记录",
+  11: "有字段的值不允许重复",
+  22: "子表字段存在重复数据",
+  31: "有必填字段未填写",
+  32: "不满足表单业务规则",
+  72: "记录已锁定，无法保存"
+};
+
+class SaveRejectedError extends Error {}
+
+// 运行环境转交的接口异常是 { errorCode, errorMessage } 对象而不是 Error，统一转成 Error，提示里才能显示原因
+function toError(error) {
+  if (error instanceof Error) return error;
+  const message = (error && (error.errorMessage || error.message || error.exception)) || (typeof error === "string" ? error : "") || "网络或服务异常";
+  return new Error(message);
+}
+
+// 明道主站接口（window.api.call）。主站没有这个接口时不会回应，所以调用方要加超时。
+function callMainWeb(controller, action, data) {
+  const group = (mdyeApis && mdyeApis[controller]) || {};
+  if (typeof group[action] === "function") return group[action](data);
+  if (window.api && typeof window.api.call === "function") return window.api.call(controller, action, data);
+  return Promise.reject(new Error(`${action} API unavailable`));
+}
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error("timeout")), ms);
+    Promise.resolve(promise).then((value) => { window.clearTimeout(timer); resolve(value); }, (error) => { window.clearTimeout(timer); reject(error); });
+  });
+}
+
+// 表单业务规则（resultCode 32 时用来显示规则里设置的提示文字）
+const ruleCache = new Map();
+function loadControlRules(worksheetId) {
+  if (!ruleCache.has(worksheetId)) {
+    const request = withTimeout(callMainWeb("worksheet", "getControlRules", { worksheetId, type: 1 }), 4000)
+      .then((response) => Array.isArray(response) ? response : response && Array.isArray(response.data) ? response.data : []);
+    ruleCache.set(worksheetId, request);
+    request.catch(() => ruleCache.delete(worksheetId));
+  }
+  return ruleCache.get(worksheetId).catch(() => []);
+}
+
+// badData 每项为“字段ID:规则ID:记录ID”（同 pd-openweb getRuleErrorInfo），提示文字是规则里“提示错误”（ruleItems type 6）的 message
+async function ruleErrorText(worksheetId, badData) {
+  const ruleIds = (Array.isArray(badData) ? badData : []).map((item) => String(item || "").split(":").reverse()[1]).filter(Boolean);
+  if (!ruleIds.length || !worksheetId) return "";
+  const rules = await loadControlRules(worksheetId);
+  const texts = [];
+  ruleIds.forEach((ruleId) => {
+    const rule = rules.find((item) => item && item.ruleId === ruleId);
+    if (!rule) return;
+    const messages = (rule.ruleItems || []).filter((item) => Number(item.type) === 6 && item.message).map((item) => item.message);
+    (messages.length ? messages : [rule.name]).forEach((text) => { if (text && !texts.includes(text)) texts.push(text); });
+  });
+  return texts.join("；");
+}
+
+function relationItems(value) {
+  if (Array.isArray(value)) return value;
+  if (value === "" || value === null || value === undefined) return [];
+  if (typeof value !== "string" || !/^\s*\[/.test(value)) return null;
+  try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : null; } catch (_) { return null; }
+}
+
+// 关联记录字段：明道返回保存后的记录，核对里面确实是刚写入的记录 ID，避免“返回成功但关联没变”
+function verifyRelationSaved(savedRow, payload) {
+  (payload.newOldControl || []).forEach((control) => {
+    if (Number(control.type) !== 29 || !savedRow || !Object.prototype.hasOwnProperty.call(savedRow, control.controlId)) return;
+    const wanted = (relationItems(control.value) || []).map((item) => item && item.sid).filter(Boolean);
+    const saved = relationItems(savedRow[control.controlId]);
+    if (!wanted.length || saved === null) return;
+    const savedSids = saved.map((item) => item && (item.sid || item.rowid)).filter(Boolean);
+    if (wanted.every((sid) => savedSids.includes(sid))) return;
+    const savedNames = saved.map((item) => item && item.name).filter(Boolean).join("、") || "空";
+    throw new SaveRejectedError(`明道没有保存“${control.controlName || "关联字段"}”（保存后仍为“${savedNames}”）`);
+  });
+}
+
+async function assertRowSaved(result, payload) {
+  // 运行环境没有返回任何结果：无法判断，按成功处理（之后刷新时仍会核对记录是否真的改了）
+  if (result === undefined) return;
+  const code = result && typeof result === "object" ? Number(result.resultCode) : NaN;
+  if (result && typeof result === "object" && result.data && (result.resultCode === undefined || code === 1)) {
+    verifyRelationSaved(result.data, payload);
+    return;
+  }
+  let reason = RECORD_RESULT_TEXT[code] || (Number.isFinite(code) ? `明道返回错误码 ${code}` : "明道没有返回保存结果");
+  if (code === 11) {
+    const names = (Array.isArray(result.badData) ? result.badData : [])
+      .map((id) => (controlsFromConfig().find((control) => control.controlId === id) || {}).controlName).filter(Boolean);
+    if (names.length) reason = `“${names.join("、")}”的值不允许重复`;
+  }
+  if (code === 32) {
+    const text = await ruleErrorText(payload.worksheetId, result.badData);
+    if (text) reason = `${reason}：${text}`;
+  }
+  throw new SaveRejectedError(reason);
+}
+
 async function updateRow(payload) {
-  if (typeof runtimeApi.updateWorksheetRow === "function") return runtimeApi.updateWorksheetRow(payload);
-  if (typeof worksheetApi.updateWorksheetRow === "function") return worksheetApi.updateWorksheetRow(payload);
-  if (window.api && typeof window.api.call === "function") return window.api.call("worksheet", "updateWorksheetRow", payload);
-  throw new Error("updateWorksheetRow API unavailable");
+  let result;
+  try {
+    if (typeof runtimeApi.updateWorksheetRow === "function") result = await runtimeApi.updateWorksheetRow(payload);
+    else if (typeof worksheetApi.updateWorksheetRow === "function") result = await worksheetApi.updateWorksheetRow(payload);
+    else if (window.api && typeof window.api.call === "function") result = await window.api.call("worksheet", "updateWorksheetRow", payload);
+    else throw new Error("updateWorksheetRow API unavailable");
+  } catch (error) { throw toError(error); }
+  await assertRowSaved(result, payload);
+  return result;
 }
 
 async function deleteWorksheetRows({ appId, worksheetId, viewId, rowIds }) {
-  if (typeof runtimeApi.deleteWorksheetRow === "function") return runtimeApi.deleteWorksheetRow({ appId, worksheetId, rowIds });
-  const payload = { appId, worksheetId, viewId, rowIds, isAll: false, excludeRowIds: [], filterControls: [], keyWords: "", fastFilters: [], navGroupFilters: [], filtersGroup: [], thoroughDelete: false };
-  if (typeof worksheetApi.deleteWorksheetRows === "function") return worksheetApi.deleteWorksheetRows(payload);
-  if (window.api && typeof window.api.call === "function") return window.api.call("worksheet", "deleteWorksheetRows", payload);
-  throw new Error("deleteWorksheetRows API unavailable");
+  let result;
+  try {
+    if (typeof runtimeApi.deleteWorksheetRow === "function") result = await runtimeApi.deleteWorksheetRow(compact({ appId, worksheetId, viewId, rowIds }));
+    else {
+      const payload = { appId, worksheetId, viewId, rowIds, isAll: false, excludeRowIds: [], filterControls: [], keyWords: "", fastFilters: [], navGroupFilters: [], filtersGroup: [], thoroughDelete: false };
+      if (typeof worksheetApi.deleteWorksheetRows === "function") result = await worksheetApi.deleteWorksheetRows(payload);
+      else if (window.api && typeof window.api.call === "function") result = await window.api.call("worksheet", "deleteWorksheetRows", payload);
+      else throw new Error("deleteWorksheetRows API unavailable");
+    }
+  } catch (error) { throw toError(error); }
+  if (result === false || result === null || (result && typeof result === "object" && "isSuccess" in result && !result.isSuccess)) {
+    throw new SaveRejectedError("明道没有删除记录（可能没有删除权限或记录已锁定）");
+  }
+  return result;
 }
 
 function runWhenIdle(task) {
@@ -435,6 +567,24 @@ async function runConcurrently(tasks, limit = 4) {
   if (failure) throw failure;
 }
 
+// 逐条执行（最多 4 个并发），返回每条的结果 { error }；某一条失败不影响其他条。
+// 用于“部分记录被明道拒绝”时只恢复失败的那几条，成功的保持新值。
+async function runEach(tasks, limit = 4) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+    while (next < tasks.length) {
+      const index = next++;
+      try { results[index] = { value: await runWhenIdle(tasks[index]) }; } catch (error) { results[index] = { error: toError(error) }; }
+    }
+  }));
+  return results;
+}
+
+function uniqueReasons(results) {
+  return Array.from(new Set(results.filter((result) => result && result.error).map((result) => result.error.message || "保存失败"))).join("；");
+}
+
 async function getWorksheetButtons(payload) {
   if (worksheetApi && typeof worksheetApi.getWorksheetBtns === "function") return worksheetApi.getWorksheetBtns(payload);
   if (runtimeApi && typeof runtimeApi.getWorksheetBtns === "function") return runtimeApi.getWorksheetBtns(payload);
@@ -444,10 +594,18 @@ async function getWorksheetButtons(payload) {
 
 async function startProcess(payload) {
   const processApi = (mdyeApis && mdyeApis.process) || {};
-  if (typeof processApi.startProcess === "function") return processApi.startProcess(payload);
-  if (runtimeApi && typeof runtimeApi.startProcess === "function") return runtimeApi.startProcess(payload);
-  if (window.api && typeof window.api.call === "function") return window.api.call("process", "startProcess", payload);
-  throw new Error("startProcess API unavailable");
+  let result;
+  try {
+    if (typeof processApi.startProcess === "function") result = await processApi.startProcess(payload);
+    else if (runtimeApi && typeof runtimeApi.startProcess === "function") result = await runtimeApi.startProcess(payload);
+    else if (window.api && typeof window.api.call === "function") result = await window.api.call("process", "startProcess", payload);
+    else throw new Error("startProcess API unavailable");
+  } catch (error) { throw toError(error); }
+  // 与明道自定义按钮一致：返回空/false 表示工作流没有启动
+  if (!result || (typeof result === "object" && (result.data === false || result.isSuccess === false))) {
+    throw new SaveRejectedError("记录不满足执行条件或流程尚未启用");
+  }
+  return result;
 }
 
 function extractButtons(response) {
@@ -509,6 +667,14 @@ function relationSidFromRows(control, name, rows) {
     if (hit) return hit.sid;
   }
   return "";
+}
+
+// 某条记录某个关联字段关联的记录（视图数据里没带出关联值时用）
+async function getRowRelationRows(payload) {
+  if (typeof runtimeApi.getRowRelationRows === "function") return runtimeApi.getRowRelationRows(payload);
+  if (typeof worksheetApi.getRowRelationRows === "function") return worksheetApi.getRowRelationRows(payload);
+  if (window.api && typeof window.api.call === "function") return window.api.call("worksheet", "getRowRelationRows", payload);
+  throw new Error("getRowRelationRows API unavailable");
 }
 
 async function fetchControlsOf(payload) {
@@ -747,7 +913,7 @@ function getQuantityProgress(row, enabled) {
   };
 }
 
-const ScheduleCard = React.memo(function ScheduleCard({ row, index, selected, scheduled, title, fields, actionsRef }) {
+const ScheduleCard = React.memo(function ScheduleCard({ row, index, selected, flashed, scheduled, title, fields, actionsRef }) {
   const columnWidths = fields.map((field) => `${field.width}px`);
   const actionWidth = scheduled ? 56 : 62;
   const tableMinWidth = CHECK_COLUMN_WIDTH + (scheduled ? 34 : 0) + actionWidth + fields.reduce((sum, field) => sum + field.width, 0);
@@ -755,7 +921,7 @@ const ScheduleCard = React.memo(function ScheduleCard({ row, index, selected, sc
   const pending = Boolean(row.__pending);
   return (
     <article
-      className={`schedule-row ${scheduled ? "scheduled" : ""} ${selected ? "selected" : ""} ${pending ? "pending-row" : ""}`}
+      className={`schedule-row ${scheduled ? "scheduled" : ""} ${selected ? "selected" : ""} ${pending ? "pending-row" : ""} ${flashed ? "row-flash" : ""}`}
       draggable={!pending}
       title={pending ? "分拆结果生成中，完成后自动替换为新记录" : undefined}
       onDragStart={(event) => {
@@ -873,9 +1039,11 @@ function SelectAllHeader({ total, selectedCount, onSelectAll, onClear }) {
 const VIRTUAL_ROW_HEIGHT = 34;
 const VIRTUAL_OVERSCAN = 12;
 
-function VirtualCardList({ rows, renderRow, empty, resetKey }) {
+function VirtualCardList({ rows, renderRow, empty, resetKey, focus }) {
   const listRef = useRef(null);
   const [viewport, setViewport] = useState({ scrollTop: 0, height: 700 });
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
 
   useEffect(() => {
     const scrollElement = listRef.current?.parentElement;
@@ -906,6 +1074,17 @@ function VirtualCardList({ rows, renderRow, empty, resetKey }) {
     if (scrollElement) scrollElement.scrollTop = 0;
     setViewport((current) => current.scrollTop === 0 ? current : { ...current, scrollTop: 0 });
   }, [resetKey]);
+
+  // 滚动到指定记录（更换机床后定位到被移动的记录）。放在 resetKey 之后，切换卡片时先回顶再定位。
+  useEffect(() => {
+    const scrollElement = listRef.current?.parentElement;
+    const index = focus ? rowsRef.current.findIndex((row) => focus.rowIds.has(row.rowid)) : -1;
+    if (!scrollElement || index < 0) return;
+    const head = Math.max(0, listRef.current.getBoundingClientRect().top - scrollElement.getBoundingClientRect().top + scrollElement.scrollTop);
+    const top = Math.max(0, head + index * VIRTUAL_ROW_HEIGHT - Math.max(0, scrollElement.clientHeight - head - VIRTUAL_ROW_HEIGHT) / 2);
+    scrollElement.scrollTop = top;
+    setViewport({ scrollTop: scrollElement.scrollTop, height: scrollElement.clientHeight });
+  }, [focus && focus.token]);
 
   const virtualized = rows.length > 80;
   const visibleCount = Math.ceil(viewport.height / VIRTUAL_ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
@@ -979,6 +1158,13 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [syncCount, setSyncCount] = useState(0);
   const [notice, setNotice] = useState("");
+  // 提示条上的按钮（如“返回原机床”）：{ text, label, run }，只在提示文字仍是 text 时显示
+  const [noticeAction, setNoticeAction] = useState(null);
+  const noticeRef = useRef(notice);
+  noticeRef.current = notice;
+  // 高亮（并滚动到）刚被更换机床的记录：{ rowIds: Set, token }
+  const [flash, setFlash] = useState(null);
+  const flashTimerRef = useRef(null);
   const [dragged, setDragged] = useState(null);
   const [selectedRowIds, setSelectedRowIds] = useState([]);
   const [leftWidth, setLeftWidth] = useState(39);
@@ -1041,6 +1227,9 @@ export default function App() {
   const patchVersionRef = useRef(0);
   // 分拆占位行：tempId -> { placeholder, identity, baselineIds, submittedAt }
   const pendingSplitsRef = useRef(new Map());
+  // 分拆出来但不在原记录机床上的新记录：{ rowid, machine(应在的机床), from(实际机床), orderNo }，由下面的 effect 改回原机床
+  const splitMachineFixRef = useRef([]);
+  const [splitFixTick, setSplitFixTick] = useState(0);
   // 已在界面删除、后台删除请求尚未完成的记录
   const pendingDeletesRef = useRef(new Set());
   // 后台写入队列：所有接口请求串行排队，不阻塞界面；队列清空后再统一刷新一次。
@@ -1090,7 +1279,8 @@ export default function App() {
       const responseControls = extractControls(response);
       if (responseControls.length && !fullControlsLoaded) fetchedControls = responseControls;
       const now = Date.now();
-      let expiredRows = 0;
+      // 已提交保存、但过了很久明道里仍不是新值的记录（明道返回成功却没改）：恢复为明道数据并列出生产单号
+      const expiredRows = [];
       const previousById = new Map(rowsRef.current.filter((row) => !row.__pending).map((row) => [row.rowid, row]));
       const serverRows = extractRows(response).map(normalizeRow).filter((row) => row.rowid && !pendingDeletesRef.current.has(row.rowid));
       const next = serverRows.map((row) => {
@@ -1105,7 +1295,7 @@ export default function App() {
         const timeout = pending.soft ? 9000 : 15000;
         if (pending.savedAt && now - pending.savedAt > timeout) {
           pendingPatchRef.current.delete(row.rowid);
-          if (!pending.soft && keys.some((key) => CORE_PATCH_KEYS.has(key) && !patchValueMatches(key, row[key], pending.patch[key]))) expiredRows += 1;
+          if (!pending.soft && keys.some((key) => CORE_PATCH_KEYS.has(key) && !patchValueMatches(key, row[key], pending.patch[key]))) expiredRows.push(row);
           return row;
         }
         if (pending.savedAt) awaitingSavedRows = true;
@@ -1116,19 +1306,37 @@ export default function App() {
       const serverIds = new Set(serverRows.map((row) => row.rowid));
       pendingPatchRef.current.forEach((_, rowId) => { if (!serverIds.has(rowId) && !String(rowId).startsWith("__")) pendingPatchRef.current.delete(rowId); });
       let placeholderTimeout = false;
+      const machineFixes = [];
       pendingSplitsRef.current.forEach((split, tempId) => {
-        const created = serverRows.some((row) => splitIdentity(row) === split.identity && !split.baselineIds.has(row.rowid));
-        if (created) { pendingSplitsRef.current.delete(tempId); return; }
+        // 新记录 = 分拆前没有的、同机床同订单的记录；找不到时再找同订单同工序、数量等于拆出量的记录（工作流建到了别的机床上），登记改回原机床
+        const fresh = (row) => !split.baselineIds.has(row.rowid);
+        const created = serverRows.find((row) => fresh(row) && splitIdentity(row) === split.identity)
+          || serverRows.find((row) => fresh(row) && splitOrderIdentity(row) === split.orderIdentity
+            && Number(row.scheduleQuantity) === Number(split.placeholder.scheduleQuantity));
+        if (created) {
+          pendingSplitsRef.current.delete(tempId);
+          if (created.machine !== split.placeholder.machine) {
+            machineFixes.push({ rowid: created.rowid, machine: split.placeholder.machine, from: created.machine, orderNo: created.orderNo });
+          }
+          return;
+        }
         if (split.submittedAt && now - split.submittedAt > 20000) { pendingSplitsRef.current.delete(tempId); placeholderTimeout = true; return; }
         if (split.submittedAt) awaitingSavedRows = true;
         const anchorIndex = next.findIndex((row) => row.rowid === split.sourceId);
         next.splice(anchorIndex < 0 ? next.length : anchorIndex + 1, 0, split.placeholder);
       });
+      if (machineFixes.length) {
+        splitMachineFixRef.current.push(...machineFixes);
+        setSplitFixTick((tick) => tick + 1);
+      }
       const current = rowsRef.current;
       const unchanged = current.length === next.length && next.every((row, index) => row === current[index]);
       // 低优先级提交：大量记录重新渲染时不卡住正在进行的点击、拖拽和输入。
       if (!unchanged) startTransition(() => setRows(() => reconcilePending(next)));
-      if (expiredRows) setNotice(`${expiredRows} 条记录未能确认保存，请检查明道云数据`);
+      if (expiredRows.length) {
+        const orders = expiredRows.map((row) => row.orderNo).filter((value) => value && value !== "—");
+        setNotice(`${expiredRows.length} 条记录明道未保存，已恢复为明道中的数据（${orders.length ? `${orders.slice(0, 4).join("、")}${orders.length > 4 ? " 等" : ""}` : "请检查明道云数据"}）`);
+      }
       else if (placeholderTimeout) setNotice("分拆结果还未生成，请稍后刷新查看");
       else if (!next.length) setNotice("当前视图暂无记录");
     } catch (error) {
@@ -1151,9 +1359,11 @@ export default function App() {
 
   useEffect(() => {
     if (!notice) return undefined;
-    const timer = window.setTimeout(() => setNotice((current) => current === notice ? "" : current), /失败|未能|错误/.test(notice) ? 8000 : 4000);
+    // 失败提示停留 10 秒；带按钮的提示（如“返回原机床”）停留 8 秒；其他 4 秒
+    const duration = /失败|未能|错误|未保存/.test(notice) ? 10000 : noticeAction && noticeAction.text === notice ? 8000 : 4000;
+    const timer = window.setTimeout(() => setNotice((current) => current === notice ? "" : current), duration);
     return () => window.clearTimeout(timer);
-  }, [notice]);
+  }, [notice, noticeAction]);
 
   const scheduleRefresh = useCallback((delay = 180) => {
     window.clearTimeout(refreshTimerRef.current);
@@ -1188,18 +1398,23 @@ export default function App() {
       previousValues.set(row.rowid, Object.fromEntries(Object.keys(patch).map((key) => [key, row[key]])));
       return { ...row, ...patch, __sig: "" };
     }));
+    // saved / rollback 可只针对其中部分记录（only = rowId 列表），用于部分记录被明道拒绝的情况
     return {
       version,
-      saved() {
+      saved(only) {
+        const subset = only ? new Set(only) : null;
         patchesById.forEach((_, rowId) => {
+          if (subset && !subset.has(rowId)) return;
           const pending = pendingPatchRef.current.get(rowId);
           if (pending && pending.version === version) pending.savedAt = Date.now();
         });
       },
-      rollback() {
+      rollback(only) {
         // 只回滚仍由本次操作控制的记录；之后又被其他操作修改过的记录保持最新状态。
+        const subset = only ? new Set(only) : null;
         const restore = new Set();
         patchesById.forEach((_, rowId) => {
+          if (subset && !subset.has(rowId)) return;
           const pending = pendingPatchRef.current.get(rowId);
           if (pending && pending.version === version) {
             pendingPatchRef.current.delete(rowId);
@@ -1452,6 +1667,29 @@ export default function App() {
     return encodeLikeRows(control, name, rowsRef.current, rowKey);
   };
 
+  // 分拆出来的记录必须在原记录的机床上：明道“分拆”工作流把新记录建在别的机床上时（如“打包”），插件把它改回原机床。
+  useEffect(() => {
+    if (!splitMachineFixRef.current.length) return;
+    const fixes = splitMachineFixRef.current.splice(0);
+    const machineControl = resolveField("machine");
+    if (!machineControl) return;
+    fixes.forEach((fix) => {
+      let value;
+      try { value = encodeFieldValue(machineControl, fix.machine, "machine"); }
+      catch (error) { setNotice(`分拆出的记录 ${fix.orderNo} 在“${fix.from}”上，未能改回原机床“${fix.machine}”：${error.message}`); return; }
+      const optimistic = applyOptimistic(new Map([[fix.rowid, { machine: fix.machine }]]));
+      enqueueSync(() => updateRow({
+        appId, worksheetId, viewId, rowId: fix.rowid,
+        newOldControl: [{ controlId: machineControl.controlId, controlName: machineControl.controlName, type: machineControl.type, value }]
+      }))
+        .then(() => optimistic.saved())
+        .catch((error) => {
+          optimistic.rollback();
+          setNotice(`分拆出的记录 ${fix.orderNo} 在“${fix.from}”上，未能改回原机床“${fix.machine}”：${error.message}`);
+        });
+    });
+  }, [splitFixTick]);
+
   // 每个工序下有哪些机床（按机床序号、名称排列），用于“更换机床”只能选同工序的机床
   const machinesByProcess = useMemo(() => {
     const byProcess = new Map();
@@ -1476,7 +1714,78 @@ export default function App() {
     return [...fromRows, ...fromTable];
   };
 
+  // 提示条：可带一个按钮（如“返回原机床”），提示文字被其他提示替换后按钮随之消失
+  const showNotice = (text, action = null) => {
+    setNotice(text);
+    setNoticeAction(action ? { ...action, text } : null);
+  };
+
+  // 高亮并滚动到这些记录（约 6 秒后取消高亮）
+  const flashRows = (rowIds) => {
+    if (!rowIds.length) return;
+    const token = Date.now() + Math.random();
+    setFlash({ rowIds: new Set(rowIds), token });
+    window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => setFlash((current) => current && current.token === token ? null : current), 6000);
+  };
+  useEffect(() => () => window.clearTimeout(flashTimerRef.current), []);
+
+  const machineKeyName = (key) => key === "ALL" ? "全部机床"
+    : (processGroups.flatMap((group) => group.machines).find((machine) => machine.key === key) || {}).name || "";
+  // 提示里列出的生产单号（最多 4 个）
+  const orderNoList = (list) => {
+    const orders = list.map((row) => row.orderNo).filter((value) => value && value !== "—");
+    return orders.length ? `${orders.slice(0, 4).join("、")}${orders.length > 4 ? ` 等 ${orders.length} 条` : ""}` : `${list.length} 条`;
+  };
+  const activeMachineKeyRef = useRef(activeMachineKey);
+  activeMachineKeyRef.current = activeMachineKey;
+
+  // 更换机床 / 合并机床共用：界面先移动记录（切到目标卡片并高亮），后台逐条写入；
+  // 明道拒绝的记录（锁定、业务规则等）立即恢复并说明原因，成功的保持新机床。
+  const moveRowsToMachine = (picked, target, machineControl, encodedMachine, label) => {
+    const sourceKey = activeMachineKey;
+    const targetKey = sourceKey === "ALL" ? "ALL" : machineCardKey({ ...picked[0], machine: target });
+    const moved = targetKey !== sourceKey;
+    const sourceName = machineKeyName(sourceKey);
+    const pickedIds = picked.map((row) => row.rowid);
+    const pickedIdSet = new Set(pickedIds);
+    const optimistic = applyOptimistic(new Map(picked.map((row) => [row.rowid, { machine: target }])));
+    setSelectedRowIds((current) => current.filter((rowId) => !pickedIdSet.has(rowId)));
+    if (moved) changeMachine(targetKey);
+    flashRows(pickedIds);
+    const back = moved ? { label: `返回“${sourceName}”`, run: () => changeMachine(sourceKey) } : null;
+    const savingText = `${label}：${orderNoList(picked)} → “${target}”${moved ? `，已切换到“${machineKeyName(targetKey) || target}”卡片` : ""}（黄色高亮），正在保存到明道…`;
+    showNotice(savingText, back);
+    enqueueSync(() => runEach(picked.map((row) => () => updateRow({
+      appId, worksheetId, viewId, rowId: row.rowid,
+      newOldControl: [{ controlId: machineControl.controlId, controlName: machineControl.controlName, type: machineControl.type, value: encodedMachine }]
+    }))))
+      .then((results) => {
+        const saved = picked.filter((_, index) => !results[index].error);
+        const failed = picked.filter((_, index) => results[index].error);
+        optimistic.saved(saved.map((row) => row.rowid));
+        if (!failed.length) {
+          // 用户还在看这条提示时，改成“已保存”
+          if (noticeRef.current === savingText) showNotice(`${label}：${orderNoList(picked)} 已改为“${target}”，已保存到明道`, back);
+          return;
+        }
+        optimistic.rollback(failed.map((row) => row.rowid));
+        // 全部失败且还停在目标卡片：回到原卡片，高亮恢复的记录
+        if (!saved.length && moved && activeMachineKeyRef.current === targetKey) changeMachine(sourceKey);
+        flashRows(failed.map((row) => row.rowid));
+        const reasons = uniqueReasons(results);
+        showNotice(saved.length
+          ? `${label}：${saved.length} 条已改为“${target}”；${failed.length} 条未保存，已恢复（${orderNoList(failed)}）：${reasons}`
+          : `${label}失败，已恢复（${orderNoList(failed)}）：${reasons}`);
+      })
+      .catch((error) => {
+        optimistic.rollback();
+        showNotice(`${label}失败，已恢复：${toError(error).message}`);
+      });
+  };
+
   // 更换机床：把当前栏里勾选的任务换到同工序的另一台机床，工序、状态、排程顺序不变。
+  // 不预选目标机床，避免没看清就点了确认；确认后切到目标卡片并高亮这些记录。
   const openMachineChange = (lane) => {
     const laneRows = lane === "queued" ? unscheduled : scheduled;
     const picked = laneRows.filter((row) => selectedRowIdSet.has(row.rowid) && !row.__pending);
@@ -1494,11 +1803,11 @@ export default function App() {
       setNotice(`工序“${processes[0]}”下没有其他机床可更换`);
       return;
     }
-    setMachineChange({ lane, rowIds: picked.map((row) => row.rowid), process: processes[0], target: options[0] });
+    setMachineChange({ lane, rowIds: picked.map((row) => row.rowid), process: processes[0], target: "" });
   };
 
   const confirmMachineChange = () => {
-    if (!machineChange) return;
+    if (!machineChange || !machineChange.target) return;
     const machineControl = resolveField("machine");
     if (!machineControl) {
       setNotice("请先在插件设置中映射机床字段");
@@ -1511,20 +1820,7 @@ export default function App() {
     let encodedMachine;
     try { encodedMachine = encodeFieldValue(machineControl, target, "machine"); }
     catch (error) { setNotice(`更换机床失败：${error.message}`); return; }
-    const optimistic = applyOptimistic(new Map(picked.map((row) => [row.rowid, { machine: target }])));
-    const pickedIds = new Set(picked.map((row) => row.rowid));
-    setSelectedRowIds((current) => current.filter((rowId) => !pickedIds.has(rowId)));
-    const stays = picked.every((row) => machineCardKey({ ...row, machine: target }) === activeMachineKey) || activeMachineKey === "ALL";
-    setNotice(`已将 ${picked.length} 条任务更换到“${target}”${stays ? "" : "，可在对应机床卡片中查看"}`);
-    enqueueSync(() => runConcurrently(picked.map((row) => () => updateRow({
-      appId, worksheetId, viewId, rowId: row.rowid,
-      newOldControl: [{ controlId: machineControl.controlId, controlName: machineControl.controlName, type: machineControl.type, value: encodedMachine }]
-    }))))
-      .then(() => optimistic.saved())
-      .catch((error) => {
-        optimistic.rollback();
-        setNotice(`更换机床失败，已恢复：${error.message || "请检查机床字段权限"}`);
-      });
+    moveRowsToMachine(picked, target, machineControl, encodedMachine, "更换机床");
   };
 
   const changeMachineButton = (lane, laneRows) => {
@@ -1554,19 +1850,8 @@ export default function App() {
     let encodedMachine;
     try { encodedMachine = encodeFieldValue(machineControl, targetMachine.name, "machine"); }
     catch (error) { setNotice(`合并机床失败：${error.message}`); return; }
-    // 先切到目标机床并改好界面，后台再逐条写入机床字段。
-    const optimistic = applyOptimistic(new Map(sourceRows.map((row) => [row.rowid, { machine: targetMachine.name }])));
-    changeMachine(targetMachine.key);
-    setNotice(`已将 ${sourceRows.length} 条任务从“${activeMachineInfo.name}”合并至“${targetMachine.name}”，工序“${activeMachineGroup.name}”保持不变`);
-    enqueueSync(() => runConcurrently(sourceRows.map((row) => () => updateRow({
-      appId, worksheetId, viewId, rowId: row.rowid,
-      newOldControl: [{ controlId: machineControl.controlId, controlName: machineControl.controlName, type: machineControl.type, value: encodedMachine }]
-    }))))
-      .then(() => optimistic.saved())
-      .catch((error) => {
-        optimistic.rollback();
-        setNotice(`合并机床失败，已恢复：${error.message || "请检查机床字段权限"}`);
-      });
+    // 先切到目标机床并改好界面，后台再逐条写入机床字段（工序保持不变）。
+    moveRowsToMachine(sourceRows, targetMachine.name, machineControl, encodedMachine, `合并机床（${activeMachineInfo.name}）`);
   };
 
   // 勾选：表头勾选框/菜单全选、全不选当前列表（筛选后可见的记录）；单行勾选互不影响。
@@ -1695,13 +1980,18 @@ export default function App() {
       } : null;
     }).filter(Boolean);
     if (!requests.length) return;
-    try {
-      window.__machineSchedulerLastOrderSave = requests;
-      await runConcurrently(requests.map((request) => () => updateRow(request.payload)));
-    } catch (error) {
-      window.__machineSchedulerLastOrderError = { message: error.message, requests };
-      throw new Error(error.message || "请检查排程状态和排程序号字段权限及映射");
-    }
+    window.__machineSchedulerLastOrderSave = requests;
+    const results = await runEach(requests.map((request) => () => updateRow(request.payload)));
+    const failedIds = requests.filter((_, index) => results[index].error).map((request) => request.rowId);
+    if (!failedIds.length) return;
+    // 只有部分记录被明道拒绝时，调用方据 failedIds / savedIds 只恢复失败的记录
+    const failedRows = failedIds.map((rowId) => changed.find((row) => row.rowid === rowId)).filter(Boolean);
+    const orders = failedRows.map((row) => row.orderNo).filter((value) => value && value !== "—");
+    const error = new Error(`${failedIds.length} 条明道未保存（${orders.length ? orders.slice(0, 4).join("、") + (orders.length > 4 ? " 等" : "") : "请检查字段权限和映射"}）：${uniqueReasons(results)}`);
+    error.failedIds = failedIds;
+    error.savedIds = requests.filter((_, index) => !results[index].error).map((request) => request.rowId);
+    window.__machineSchedulerLastOrderError = { message: error.message, requests };
+    throw error;
   };
 
   // 拖拽结果已显示在界面上；连续拖拽 400ms 内合并成一次后台保存。
@@ -1723,10 +2013,13 @@ export default function App() {
       enqueueSync(() => persistOrder(entries.map((entry) => entry.row), changedIds, entries.map((entry) => entry.previous)))
         .then(() => save.optimistic.forEach((optimistic) => optimistic.saved()))
         .catch((error) => {
-          // 恢复到拖拽前的状态；之后又被其他操作改过的记录不动。
+          // 明道保存了的记录保持新位置；没保存的恢复到拖拽前的状态；之后又被其他操作改过的记录不动。
+          if (error.savedIds) save.optimistic.forEach((optimistic) => optimistic.saved(error.savedIds));
+          const failedIdSet = error.failedIds ? new Set(error.failedIds) : null;
           const maxVersion = Math.max(...save.optimistic.map((optimistic) => optimistic.version));
           const restore = new Map();
           entries.forEach((entry) => {
+            if (failedIdSet && !failedIdSet.has(entry.row.rowid)) return;
             const pending = pendingPatchRef.current.get(entry.row.rowid);
             if (pending && pending.version > maxVersion) return;
             pendingPatchRef.current.delete(entry.row.rowid);
@@ -1832,6 +2125,54 @@ export default function App() {
     mdyeUtils.openRecordInfo({ appId, worksheetId, viewId, recordId: row.rowid }).then(refresh);
   };
 
+  // 打印排程表：打开已排程明细关联的“排程汇总表”记录（在汇总记录里打印）。
+  // 同一批明细关联同一张汇总表；取当前卡片已排程里被关联最多的那张，视图数据没带出关联值时向明道查第一条明细的关联记录。
+  const [openingSummary, setOpeningSummary] = useState(false);
+  const openScheduleSummary = async () => {
+    const control = resolveField("scheduleSummary");
+    if (!control || !isRelationControl(control) || !control.dataSource) {
+      setNotice("未找到“排程汇总表”字段：请在明道云表中添加关联“排程汇总”表的字段“排程汇总表”，或在插件设置中映射");
+      return;
+    }
+    const details = scheduled.filter((row) => !isVirtualRow(row));
+    if (!details.length) {
+      setNotice("已排程里没有任务，无法打印排程表");
+      return;
+    }
+    if (!mdyeUtils || typeof mdyeUtils.openRecordInfo !== "function") {
+      setNotice("当前环境不支持打开记录");
+      return;
+    }
+    const counts = new Map();
+    details.forEach((row) => (relationItems(row.__raw && row.__raw[control.controlId]) || []).forEach((item) => {
+      if (!item || !item.sid) return;
+      const entry = counts.get(item.sid) || { sid: item.sid, name: item.name || "", count: 0 };
+      entry.count += 1;
+      counts.set(item.sid, entry);
+    }));
+    let target = Array.from(counts.values()).sort((a, b) => b.count - a.count)[0];
+    setOpeningSummary(true);
+    try {
+      if (!target) {
+        for (const row of details.slice(0, 3)) {
+          const response = await withTimeout(getRowRelationRows(compact({ appId, worksheetId, viewId, rowId: row.rowid, controlId: control.controlId, pageIndex: 1, pageSize: 1, getType: 1 })), 8000).catch(() => null);
+          const related = extractRows(response)[0];
+          if (related && related.rowid) { target = { sid: related.rowid, name: row.scheduleNo || "" }; break; }
+        }
+      }
+      if (!target) {
+        setNotice("已排程任务还没有排程汇总表：请先点“确定排程”，生成排程单号和汇总表后再打印");
+        return;
+      }
+      setNotice(`正在打开排程汇总表${target.name ? ` ${target.name}` : ""}，可在记录右上角“打印”`);
+      // 和在明细记录里点“排程汇总表”一样：用关联字段配置的应用和视图打开（视图里的打印模板、按钮才会出现）
+      Promise.resolve(mdyeUtils.openRecordInfo(compact({ appId: control.appId || appId, worksheetId: control.dataSource, viewId: control.viewId, recordId: target.sid })))
+        .catch((error) => setNotice(`打开排程汇总表失败：${toError(error).message}`));
+    } finally {
+      setOpeningSummary(false);
+    }
+  };
+
   // 以下所有操作都是“先改界面、后台排队保存、失败回滚”，不再等待接口返回。
   const saveScheduleQuantity = (row, rawValue) => {
     if (!scheduleQuantityControl || isVirtualRow(row)) return;
@@ -1910,9 +2251,10 @@ export default function App() {
       ...source, rowid: tempId, scheduleQuantity: splitQuantity, preSplitScheduleQuantity: splitQuantity,
       splitDifference: 0, qualifiedQuantity: 0, sequence: Number(source.sequence) || 0, __pending: true, __sig: ""
     };
+    const orderIdentity = splitOrderIdentity(source);
     const split = {
-      placeholder, identity, sourceId: source.rowid, submittedAt: 0,
-      baselineIds: new Set(rows.filter((row) => !row.__pending && splitIdentity(row) === identity).map((row) => row.rowid))
+      placeholder, identity, orderIdentity, sourceId: source.rowid, submittedAt: 0,
+      baselineIds: new Set(rows.filter((row) => !row.__pending && splitOrderIdentity(row) === orderIdentity).map((row) => row.rowid))
     };
     pendingSplitsRef.current.set(tempId, split);
     const optimistic = applyOptimistic(new Map([[source.rowid, { scheduleQuantity: retainedAmount }]]));
@@ -2111,7 +2453,8 @@ export default function App() {
             dataLog: `机床排程工作台确定排程，排程单号 ${numbers}，共 ${rowIds.length} 条`
           });
           window.__machineSchedulerLastConfirmAction = { button, payload };
-          await startProcess(payload);
+          try { await startProcess(payload); }
+          catch (error) { throw new Error(`排程单号 ${numbers} 已写入，但“确定排程”工作流没有执行：${error.message}`); }
           return numbers;
         });
       })
@@ -2128,16 +2471,15 @@ export default function App() {
 
   // 合并分拆：本记录排程量 = 本记录排程量 + 勾选的被合并记录排程量之和，被合并记录移入回收站。
   // 不再调用明道云“合并”按钮——该工作流只把拆前数量改成当前排程量，拆出去的数量没有加回来。
-  // 被合并记录 = 当前视图中同一生产单号、产品编号、产品名称的其他未生产记录（默认勾选同工序、同状态的）。
+  // 被合并记录 = 当前视图中与本记录同一机床、同一工序、同一生产单号/产品编号/产品名称的其他未生产记录（即拆出来的记录，默认勾选同状态的）。
+  // 同一订单在其他工序/机床上的记录（如“打包”）不是本记录拆出来的，不能合并（合并会把被合并记录移入回收站）。
   const mergeCandidatesFor = (target) => {
     const blank = (value) => !value || value === "—";
     if (blank(target.orderNo) && blank(target.productCode)) return [];
-    const identity = (row) => `${row.orderNo}|${row.productCode}|${row.productName}`;
+    const identity = splitIdentity(target);
     return rows.filter((row) => row.rowid !== target.rowid && !row.__pending && !pendingDeletesRef.current.has(row.rowid)
-      && !row.status.includes(STATUS.produced) && identity(row) === identity(target))
-      .sort((a, b) => (a.process === target.process ? 0 : 1) - (b.process === target.process ? 0 : 1)
-        || (a.status === target.status ? 0 : 1) - (b.status === target.status ? 0 : 1)
-        || a.sequence - b.sequence);
+      && !row.status.includes(STATUS.produced) && splitIdentity(row) === identity)
+      .sort((a, b) => (a.status === target.status ? 0 : 1) - (b.status === target.status ? 0 : 1) || a.sequence - b.sequence);
   };
   const mergeCandidates = useMemo(() => mergeTarget ? mergeCandidatesFor(mergeTarget) : [], [mergeTarget, rows]);
 
@@ -2239,7 +2581,8 @@ export default function App() {
     return enqueueSync(() => persistOrder(changed, changed.map((row) => row.rowid), changed.map((row) => currentById.get(row.rowid))))
       .then(() => { optimistic.saved(); return true; })
       .catch((error) => {
-        optimistic.rollback();
+        if (error.savedIds) optimistic.saved(error.savedIds);
+        optimistic.rollback(error.failedIds);
         setNotice(`自动排序保存失败，已恢复：${error.message || "请检查排程序号字段权限和映射"}`);
         return false;
       });
@@ -2342,24 +2685,27 @@ export default function App() {
         </div>)}
       </nav>
 
-      {notice && <div className="notice">{notice}</div>}
+      {notice && <div className={`notice ${/失败|未能|错误|未保存/.test(notice) ? "notice-error" : ""} ${noticeAction && noticeAction.text === notice ? "has-action" : ""}`} role="status">
+        <span>{notice}</span>
+        {noticeAction && noticeAction.text === notice && <button type="button" onClick={() => { const action = noticeAction; showNotice(""); action.run(); }}>{noticeAction.label}</button>}
+      </div>}
 
       <section className={`boards ${hiddenPane ? `hide-${hiddenPane}` : ""}`} ref={boardsRef} style={{ "--left-width": `${leftWidth}%` }}>
         <div className={`board unscheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("queued", e)}>
           <div className="board-head"><div>{maximizeButton("queued", "未排程")}<span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{selectedVisibleCount(unscheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(unscheduled)}</em>}{changeMachineButton("queued", unscheduled)}{activeMachineInfo && mergeTargetMachines.length > 0 && <button className="merge-machine-trigger" onClick={openMachineMerge}>合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button className="select-visible" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}>{unscheduled.length && selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("queued")} disabled={!unscheduled.length}><span>⇅</span> 自动排序</button></div></div>
           <div className="list-table">
             <div className="list-head" style={queuedTableStyle}><SelectAllHeader key="check" total={unscheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(unscheduled)} onSelectAll={() => setLaneChecked(unscheduled, true)} onClear={() => setLaneChecked(unscheduled, false)} />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={queuedFilters[fieldKeys[index]]} options={() => queuedColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("queued", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
-            <VirtualCardList rows={unscheduled} resetKey={activeMachineKey} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} selected={selectedRowIdSet.has(row.rowid)} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty"><strong>没有未排程任务</strong><span>当前机床暂无可排程订单</span></div>} />
+            <VirtualCardList rows={unscheduled} resetKey={activeMachineKey} focus={flash} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty"><strong>没有未排程任务</strong><span>当前机床暂无可排程订单</span></div>} />
           </div>
         </div>
 
         <div className="board-splitter" onPointerDown={beginResize} onDoubleClick={togglePanes} title={hiddenPane ? "双击还原左右两栏" : "拖动调整左右区域宽度；双击隐藏/还原左右区域"}><span /></div>
 
         <div className={`board scheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("scheduled", e)}>
-          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}{changeMachineButton("scheduled", scheduled)}</div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button className="select-visible" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}>{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><span>⇅</span> 自动排序</button><button className="confirm-schedule" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><span>✓</span>{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
+          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}{changeMachineButton("scheduled", scheduled)}<button type="button" className="print-schedule-trigger" onClick={openScheduleSummary} disabled={openingSummary || !scheduled.length} title="打开已排程明细关联的排程汇总表，在汇总表里打印">{openingSummary ? "打开中…" : "打印排程表"}</button></div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button className="select-visible" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}>{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><span>⇅</span> 自动排序</button><button className="confirm-schedule" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><span>✓</span>{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
           <div className="list-table">
             <div className="list-head" style={tableStyle}><SelectAllHeader key="check" total={scheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(scheduled)} onSelectAll={() => setLaneChecked(scheduled, true)} onClear={() => setLaneChecked(scheduled, false)} /><FilterHeader key="sequence" columnKey="__sequence" label="序号" value={scheduledFilters.sequence} options={() => scheduledColumnOptions("sequence")} onChange={(value) => setColumnFilter("scheduled", "sequence", value)} layoutLocked />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={scheduledFilters[fieldKeys[index]]} options={() => scheduledColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("scheduled", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
-            <VirtualCardList rows={scheduled} resetKey={activeMachineKey} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} scheduled selected={selectedRowIdSet.has(row.rowid)} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty drop-empty"><strong>拖到这里开始排程</strong><span>任务会自动生成排程序号</span></div>} />
+            <VirtualCardList rows={scheduled} resetKey={activeMachineKey} focus={flash} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} scheduled selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty drop-empty"><strong>拖到这里开始排程</strong><span>任务会自动生成排程序号</span></div>} />
           </div>
         </div>
       </section>
@@ -2385,11 +2731,12 @@ export default function App() {
         return <div className="modal-backdrop" onMouseDown={() => setMachineChange(null)}><div className="split-modal machine-change-modal" onMouseDown={(event) => event.stopPropagation()}>
           <div className="modal-title">更换机床</div>
           <p className="modal-record">{machineChange.lane === "queued" ? "未排程" : "已排程"}中勾选的 {picked.length} 条任务</p>
+          <p className="machine-change-orders" title={picked.map((row) => row.orderNo).join("、")}>生产单号：{orderNoList(picked)}</p>
           <label>工序<strong>{machineChange.process}</strong></label>
           <label>当前机床<strong className="machine-change-current">{current.map(([name, count]) => `${name}（${count}）`).join("、")}</strong></label>
-          <label>更换为<select value={machineChange.target} onChange={(event) => setMachineChange((old) => ({ ...old, target: event.target.value }))}>{options.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
-          <p className="split-hint">只能更换为同工序的机床；任务的工序、状态和排程顺序不变。</p>
-          <div className="modal-actions"><button className="secondary" onClick={() => setMachineChange(null)}>取消</button><button className="primary" onClick={confirmMachineChange}>确认更换</button></div>
+          <label>更换为<select className={machineChange.target ? "" : "unselected"} value={machineChange.target} onChange={(event) => setMachineChange((old) => ({ ...old, target: event.target.value }))}><option value="" disabled>请选择机床</option>{options.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
+          <p className="split-hint">只能更换为同工序的机床；任务的工序、状态和排程顺序不变。确认后会切换到目标机床卡片并高亮这些任务。</p>
+          <div className="modal-actions"><button className="secondary" onClick={() => setMachineChange(null)}>取消</button><button className="primary" onClick={confirmMachineChange} disabled={!machineChange.target}>确认更换</button></div>
         </div></div>;
       })()}
 
@@ -2401,6 +2748,7 @@ export default function App() {
         return <div className="modal-backdrop" onMouseDown={() => setMergeTarget(null)}><div className="split-modal merge-modal" onMouseDown={(event) => event.stopPropagation()}>
           <div className="modal-title">合并分拆记录</div>
           <p className="modal-record">{target.orderNo} · {target.productName}</p>
+          <label>机床<strong className="merge-machine">{target.machine}</strong></label>
           <label>本记录排程量<strong>{own}</strong></label>
           {mergeCandidates.length ? <div className="merge-list">
             <div className="merge-list-head"><span /><span>被合并记录（机床 / 状态）</span><span>排程量</span></div>
@@ -2409,7 +2757,7 @@ export default function App() {
               <span>{row.machine} / {row.status}</span>
               <b>{row.scheduleQuantity}</b>
             </label>)}
-          </div> : <p className="danger-text">当前视图里没有找到同一生产单号、同一产品的其他记录，无法合并。</p>}
+          </div> : <p className="danger-text">当前视图里没有找到“{target.machine}”上同一生产单号、同一产品的其他记录，无法合并（其他机床、其他工序的记录不能合并）。</p>}
           <p className="split-hint">合并后排程量：<strong>{own} + {added} = {own + added}</strong><br />勾选的 {picked.length} 条记录合并后移入明道云回收站。</p>
           <div className="modal-actions"><button className="secondary" onClick={() => setMergeTarget(null)}>取消</button><button className="primary" onClick={confirmMergeSplit} disabled={!picked.length}>确认合并</button></div>
         </div></div>;

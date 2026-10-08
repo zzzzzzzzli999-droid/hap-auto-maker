@@ -559,7 +559,7 @@ async function waitIdle(page, timeout = 20000) {
   check("按钮显示勾选条数", (await page.textContent(".unscheduled-board .change-machine-trigger")) === "更换机床 (2)");
   await page.click(".unscheduled-board .change-machine-trigger");
   await page.waitForSelector(".machine-change-modal");
-  const changeOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value));
+  const changeOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value).filter(Boolean));
   check("可选机床只有同工序（表面处理）的其他机床", JSON.stringify(changeOptions) === JSON.stringify(["大五色印刷+上油", "上油", "贴面机"]), changeOptions.join("、"));
   await page.selectOption(".machine-change-modal select", "上油");
   await page.click(".machine-change-modal .primary");
@@ -576,8 +576,9 @@ async function waitIdle(page, timeout = 20000) {
   const schedOrder = (await columnValues(page, "scheduled-board", "生产单号"))[0];
   await page.locator(".scheduled-board .schedule-row").first().locator(".check-cell input").check();
   await page.click(".scheduled-board .change-machine-trigger");
-  const schedOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value));
+  const schedOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value).filter(Boolean));
   check("已排程也能更换，选项为模切工序的其他机床", JSON.stringify(schedOptions) === JSON.stringify(["联动线开槽"]), schedOptions.join("、"));
+  await page.selectOption(".machine-change-modal select", "联动线开槽");
   await page.click(".machine-change-modal .primary");
   await page.waitForTimeout(80);
   check("已排程任务立即移到联动线卡片（已排程 5→6）", (await cardCount("平模机")).scheduled === 1 && (await cardCount("联动线")).scheduled === 6);
@@ -625,7 +626,7 @@ async function waitIdle(page, timeout = 20000) {
   await page.locator(".unscheduled-board .schedule-row").nth(0).locator(".check-cell input").check();
   await page.click(".unscheduled-board .change-machine-trigger");
   await page.waitForSelector(".machine-change-modal");
-  const relOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value));
+  const relOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value).filter(Boolean));
   check("更换机床下拉框来自“机床设置”表的同工序机床（含暂无任务的“新覆膜机”，不含其他工序）", JSON.stringify(relOptions.slice().sort()) === JSON.stringify(["上油", "大五色印刷+上油", "新覆膜机", "贴面机"].sort()), relOptions.join("、"));
   await page.selectOption(".machine-change-modal select", "上油");
   await page.click(".machine-change-modal .primary");
@@ -727,6 +728,282 @@ async function waitIdle(page, timeout = 20000) {
   const noFieldNotice = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
   const noFieldWorkflow = await page.evaluate((n) => window.__mock.calls.slice(n).some((c) => c.action === "startProcess"), callsNoField);
   check("表里没有“排程单号”字段时不触发确定排程并提示", !noFieldWorkflow && /未找到“排程单号”字段/.test(noFieldNotice), noFieldNotice);
+  await page.close();
+
+  // ---------- 12. 明道拒绝保存（接口不报错、返回失败结果）：立即恢复并说明原因；更换机床后切到目标卡片并高亮 ----------
+  page = await open(browser, "latency=300&relation=1");
+  // 每个小步骤单独捕获异常：某一步卡住只记一条失败，重新打开页面继续后面的步骤
+  const step = async (name, fn, query = "latency=300&relation=1") => {
+    try { await fn(); }
+    catch (error) {
+      check(`${name}（步骤异常）`, false, String(error && error.message || error).split("\n")[0]);
+      try { await page.close(); } catch (_) {}
+      page = await open(browser, query);
+    }
+  };
+  {
+    const notice12 = () => page.$eval(".notice", (el) => el.textContent).catch(() => "");
+    const store12 = (order) => page.evaluate((o) => {
+      const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o);
+      return r ? { machine: JSON.parse(r.c_machine)[0].name, status: r.c_status, qty: r.c_qty, sno: r.c_sno } : null;
+    }, order);
+    const activeCard = async () => ((await cardsOf(page)).flatMap((g) => g.cards).find((c) => c.active) || {}).name;
+    const laneOrders = (board) => columnValues(page, board, "生产单号");
+    const flashInfo = (board) => page.evaluate((b) => {
+      const root = document.querySelector(`.${b}`);
+      const headers = Array.from(root.querySelectorAll(".list-head > *"));
+      const index = headers.findIndex((header) => header.textContent.replace(/[▼⋮]/g, "").trim() === "生产单号");
+      const box = root.querySelector(".list-table").getBoundingClientRect();
+      const rows = Array.from(root.querySelectorAll(".schedule-row.row-flash"));
+      return {
+        orders: rows.map((row) => row.children[index]?.textContent.trim()),
+        allVisible: rows.length > 0 && rows.every((row) => { const r = row.getBoundingClientRect(); return r.top >= box.top + 20 && r.bottom <= box.bottom; }),
+        total: root.querySelectorAll(".schedule-row").length
+      };
+    }, board);
+    const openChange = async (board, count, target) => {
+      for (let i = 0; i < count; i += 1) await page.locator(`.${board} .schedule-row`).nth(i).locator(".check-cell input").check();
+      await page.click(`.${board} .change-machine-trigger`);
+      await page.waitForSelector(".machine-change-modal");
+      if (target) await page.selectOption(".machine-change-modal select", target);
+    };
+
+    // 12a 弹窗不预选；确认后切到目标卡片、高亮并滚动到被移动的记录；有“返回”按钮
+    await step("12a 更换机床弹窗与切换高亮", async () => {
+      await clickCard(page, "平模机");
+      const pmOrder = (await laneOrders("unscheduled-board"))[0];
+      await openChange("unscheduled-board", 1, "");
+      const dialog = await page.evaluate(() => ({
+        value: document.querySelector(".machine-change-modal select").value,
+        disabled: document.querySelector(".machine-change-modal .primary").disabled,
+        orders: (document.querySelector(".machine-change-modal .machine-change-orders") || {}).textContent || ""
+      }));
+      check("更换机床弹窗不预选机床，未选择时“确认更换”不可点", dialog.value === "" && dialog.disabled, JSON.stringify(dialog));
+      check("更换机床弹窗列出勾选任务的生产单号", dialog.orders.includes(pmOrder), dialog.orders);
+      await page.selectOption(".machine-change-modal select", "联动线开槽");
+      check("选好机床后“确认更换”可点", !(await page.$eval(".machine-change-modal .primary", (el) => el.disabled)));
+      await page.click(".machine-change-modal .primary");
+      await page.waitForTimeout(200);
+      check("确认后自动切换到目标机床所在卡片（联动线）", (await activeCard()) === "联动线", await activeCard());
+      const flashed = await flashInfo("unscheduled-board");
+      check("被更换的任务在目标卡片里黄色高亮，并滚动到可见位置（列表 87 条，虚拟滚动）", flashed.orders.includes(pmOrder) && flashed.allVisible, JSON.stringify(flashed));
+      const movingNotice = await notice12();
+      check("提示里写明生产单号、目标机床，并有“返回”按钮", movingNotice.includes(pmOrder) && movingNotice.includes("联动线开槽") && Boolean(await page.$(".notice.has-action button")), movingNotice);
+      await waitIdle(page);
+      check("明道确认保存后提示“已保存到明道”", /已保存到明道/.test(await notice12()), await notice12());
+      check("明道里机床已改为联动线开槽", (await store12(pmOrder)).machine === "联动线开槽", JSON.stringify(await store12(pmOrder)));
+      await page.click(".notice.has-action button");
+      await page.waitForTimeout(250);
+      check("点“返回”回到原来的机床卡片（平模机）", (await activeCard()) === "平模机", await activeCard());
+    });
+    // 12b 明道按业务规则拒绝（resultCode 32）：立即恢复（不是等 15 秒），显示规则里的提示文字和生产单号
+    await step("12b 业务规则拒绝", async () => {
+      await clickCard(page, "联动线");
+      const ruleOrders = (await laneOrders("unscheduled-board")).slice(0, 2);
+      const ruleBefore = await Promise.all(ruleOrders.map(store12));
+      await openChange("unscheduled-board", 2, "大五色印刷");
+      await page.evaluate(() => { window.__mock.rejectNext = [{ resultCode: 32, badData: ["c_machine:rule_lock:a"] }, { resultCode: 32, badData: ["c_machine:rule_lock:b"] }]; });
+      const ruleStart = Date.now();
+      await page.click(".machine-change-modal .primary");
+      await page.waitForTimeout(100);
+      check("（明道返回前）界面先移到大五色印刷卡片", (await activeCard()) === "大五色印刷", await activeCard());
+      await page.waitForFunction(() => /更换机床失败/.test((document.querySelector(".notice") || {}).textContent || ""), null, { timeout: 8000 }).catch(() => undefined);
+      const ruleElapsed = Date.now() - ruleStart;
+      const ruleNotice = await notice12();
+      check("业务规则拒绝：几秒内提示失败，带规则提示文字和生产单号", ruleElapsed < 5000 && ruleNotice.includes("已排程的任务不允许更换机床") && ruleOrders.every((o) => ruleNotice.includes(o)), `${ruleElapsed}ms；${ruleNotice}`);
+      await waitIdle(page);
+      const ruleAfter = await Promise.all(ruleOrders.map(store12));
+      const ruleUi = await laneOrders("unscheduled-board");
+      check("业务规则拒绝：回到联动线卡片，两条任务在原处，明道数据没变", (await activeCard()) === "联动线" && ruleOrders.every((o) => ruleUi.includes(o)) && JSON.stringify(ruleAfter) === JSON.stringify(ruleBefore), `${await activeCard()}；${JSON.stringify(ruleAfter)}`);
+    });
+    // 12c 明道返回成功但关联没变（resultCode 1，后道机床仍是原值）：识别为未保存并恢复
+    await step("12c 关联值未保存", async () => {
+      const ignoreOrder = (await laneOrders("unscheduled-board"))[0];
+      const ignoreBefore = await store12(ignoreOrder);
+      await openChange("unscheduled-board", 1, "大五色印刷");
+      await page.evaluate(() => { window.__mock.ignoreNext = 1; });
+      await page.click(".machine-change-modal .primary");
+      await waitIdle(page);
+      const ignoreNotice = await notice12();
+      check("返回成功但“后道机床”没变：识别为未保存，提示原因并恢复", /明道没有保存“后道机床”/.test(ignoreNotice) && ignoreNotice.includes(ignoreOrder) && (await laneOrders("unscheduled-board")).includes(ignoreOrder) && (await store12(ignoreOrder)).machine === ignoreBefore.machine, ignoreNotice);
+    });
+    // 12d 部分记录被拒绝（记录已锁定 72）：成功的保持新机床，失败的恢复，提示分别说明
+    await step("12d 部分记录被拒绝", async () => {
+      const partOrders = (await laneOrders("unscheduled-board")).slice(0, 2);
+      const partBefore = await Promise.all(partOrders.map(store12));
+      await openChange("unscheduled-board", 2, "大五色印刷");
+      await page.evaluate(() => { window.__mock.rejectNext = [{ resultCode: 72 }]; });
+      await page.click(".machine-change-modal .primary");
+      await waitIdle(page);
+      const partAfter = await Promise.all(partOrders.map(store12));
+      const changedIdx = partAfter.map((r, i) => r.machine !== partBefore[i].machine);
+      const failedOrder = partOrders[changedIdx.indexOf(false)];
+      const okOrder = partOrders[changedIdx.indexOf(true)];
+      const partNotice = await notice12();
+      check("部分被拒绝：1 条已改为大五色印刷、1 条恢复，提示写明失败的生产单号和“记录已锁定”", changedIdx.filter(Boolean).length === 1 && /1 条已改为“大五色印刷”/.test(partNotice) && partNotice.includes(failedOrder) && /记录已锁定/.test(partNotice), `${JSON.stringify(partAfter)}；${partNotice}`);
+      await clickCard(page, "大五色印刷");
+      const dwOrders12 = await laneOrders("unscheduled-board");
+      await clickCard(page, "联动线");
+      const ldOrders12 = await laneOrders("unscheduled-board");
+      check("部分被拒绝：界面与明道一致（成功的在大五色印刷，失败的仍在联动线）", dwOrders12.includes(okOrder) && ldOrders12.includes(failedOrder) && !ldOrders12.includes(okOrder), `${okOrder} / ${failedOrder}`);
+    });
+    // 12e 拖到已排程被拒绝：立即恢复并说明原因
+    await step("12e 拖动被拒绝", async () => {
+      const dragOrder12 = (await laneOrders("unscheduled-board"))[0];
+      await page.evaluate(() => { window.__mock.rejectNext = [{ resultCode: 72 }]; });
+      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await waitIdle(page);
+      const dragNotice12 = await notice12();
+      check("拖动被明道拒绝：恢复到未排程，提示原因和生产单号", (await laneOrders("unscheduled-board")).includes(dragOrder12) && !(await laneOrders("scheduled-board")).includes(dragOrder12) && /已恢复/.test(dragNotice12) && /记录已锁定/.test(dragNotice12) && dragNotice12.includes(dragOrder12) && (await store12(dragOrder12)).status.includes("k_queued"), dragNotice12);
+    });
+    // 12f 删除被拒绝（isSuccess:false）：记录恢复并提示
+    await step("12f 删除被拒绝", async () => {
+      const delOrder12 = (await laneOrders("unscheduled-board"))[0];
+      await page.evaluate(() => { window.__mock.deleteRejectNext = 1; });
+      await page.locator(".unscheduled-board .schedule-row").first().locator(".delete-icon").click();
+      await page.click(".modal-actions .danger.primary");
+      await waitIdle(page);
+      const delNotice12 = await notice12();
+      check("删除被明道拒绝：记录恢复，提示“删除失败”", (await laneOrders("unscheduled-board")).includes(delOrder12) && /删除失败/.test(delNotice12) && Boolean(await store12(delOrder12)), delNotice12);
+    });
+    // 12g 分拆：工作流没有启动（startProcess 返回 false）→ 提示原因，不留占位行
+    await step("12g 分拆工作流未启动", async () => {
+      const splitOrder12 = (await laneOrders("unscheduled-board"))[0];
+      const splitCountBefore = await page.evaluate(() => window.__mock.store.size);
+      await page.evaluate(() => { window.__mock.processRejectNext = 1; });
+      await page.locator(".unscheduled-board .schedule-row").first().locator(".split-icon").click();
+      await page.waitForSelector(".split-modal input[type=number]");
+      await page.fill(".split-modal input[type=number]", "100");
+      await page.click(".split-modal .primary");
+      await waitIdle(page);
+      const splitNotice12 = await notice12();
+      check("分拆工作流没有启动：提示“记录不满足执行条件或流程尚未启用”，不留占位行", /分拆失败/.test(splitNotice12) && /记录不满足执行条件或流程尚未启用/.test(splitNotice12) && (await page.evaluate(() => window.__mock.store.size)) === splitCountBefore && !(await page.$(".schedule-row.pending-row")), `${splitOrder12}：${splitNotice12}`);
+    });
+    // 12h 确定排程：工作流没有启动 → 明确提示单号已写入但工作流没执行
+    await step("12h 确定排程工作流未启动", async () => {
+      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await waitIdle(page);
+      await page.click(".scheduled-board .confirm-schedule");
+      await page.waitForSelector(".confirm-schedule-modal");
+      await page.evaluate(() => { window.__mock.processRejectNext = 1; });
+      await page.click(".confirm-schedule-modal .primary");
+      await waitIdle(page);
+      const confirmNotice12 = await notice12();
+      check("确定排程工作流没有启动：提示“排程单号已写入，但确定排程工作流没有执行”和原因", /确定排程失败/.test(confirmNotice12) && /已写入，但“确定排程”工作流没有执行/.test(confirmNotice12) && /记录不满足执行条件或流程尚未启用/.test(confirmNotice12), confirmNotice12);
+    });
+    // 12i 明道返回成功但实际没改（非关联字段）：超时后恢复为明道数据，并列出生产单号
+    await step("12i 返回成功但未改", async () => {
+      const silentOrder = (await laneOrders("unscheduled-board"))[0];
+      await page.evaluate(() => { window.__mock.ignoreNext = 1; });
+      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await page.waitForFunction(() => /明道未保存，已恢复为明道中的数据/.test((document.querySelector(".notice") || {}).textContent || ""), null, { timeout: 30000 }).catch(() => undefined);
+      const silentNotice = await notice12();
+      check("返回成功但实际没改：约 15 秒后恢复为明道数据，提示列出生产单号", /明道未保存，已恢复为明道中的数据/.test(silentNotice) && silentNotice.includes(silentOrder) && (await laneOrders("unscheduled-board")).includes(silentOrder), silentNotice);
+    });
+    check("页面无脚本错误（明道拒绝保存）", page.__errors.length === 0, page.__errors.join(" | "));
+    await page.screenshot({ path: path.join(__dirname, "shot-reject.png") });
+  }
+  await page.close();
+
+  // ---------- 13. 打印排程表：打开已排程明细关联的排程汇总表 ----------
+  page = await open(browser, "latency=300");
+  {
+    const opened = () => page.evaluate(() => window.__mock.opened.slice());
+    const summarySid = (no) => page.evaluate((n) => window.__mock.summarySid(n), no);
+    const notice13 = () => page.$eval(".notice", (el) => el.textContent).catch(() => "");
+    const step13 = async (name, fn) => {
+      try { await fn(); }
+      catch (error) { check(`${name}（步骤异常）`, false, String(error && error.message || error).split("\n")[0]); }
+    };
+    await step13("13a 打开汇总表", async () => {
+      check("已排程栏标题处有“打印排程表”按钮", ((await page.textContent(".scheduled-board .board-head .print-schedule-trigger")) || "").trim() === "打印排程表");
+      await clickCard(page, "联动线");
+      await page.click(".scheduled-board .print-schedule-trigger");
+      await page.waitForTimeout(400);
+      const last = (await opened()).pop();
+      check("点击后打开已排程明细关联的排程汇总表（表和视图取关联字段配置 dataSource/viewId，不写死 ID）", last && last.worksheetId === "ws_summary" && last.viewId === "view_summary" && last.recordId === await summarySid("印刷20261001001") && last.appId === "app1", JSON.stringify(last));
+    });
+    await step13("13b 确定排程后打开新汇总表", async () => {
+      await page.click(".scheduled-board .confirm-schedule");
+      await page.waitForSelector(".confirm-schedule-modal");
+      await page.click(".confirm-schedule-modal .primary");
+      await waitIdle(page);
+      const newNo = (await columnValues(page, "scheduled-board", "排程单号"))[0];
+      await page.click(".scheduled-board .print-schedule-trigger");
+      await page.waitForTimeout(400);
+      const last = (await opened()).pop();
+      check("确定排程后（工作流生成新汇总表并关联），打开的是新排程单号的汇总表", Boolean(newNo) && newNo !== "印刷20261001001" && last && last.recordId === await summarySid(newNo), `${newNo} ${JSON.stringify(last)}`);
+    });
+    await step13("13c 没有汇总表", async () => {
+      await clickCard(page, "大五色印刷");
+      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await waitIdle(page);
+      const before = (await opened()).length;
+      await page.click(".scheduled-board .print-schedule-trigger");
+      await page.waitForFunction(() => /还没有排程汇总表/.test((document.querySelector(".notice") || {}).textContent || ""), null, { timeout: 10000 }).catch(() => undefined);
+      check("这批还没有汇总表时不打开，提示先确定排程", (await opened()).length === before && /还没有排程汇总表/.test(await notice13()), await notice13());
+    });
+    check("页面无脚本错误（打印排程表）", page.__errors.length === 0, page.__errors.join(" | "));
+  }
+  await page.close();
+  page = await open(browser, "latency=300&summarycount=1");
+  try {
+    await clickCard(page, "平模机");
+    await page.click(".scheduled-board .print-schedule-trigger");
+    await page.waitForFunction(() => window.__mock.opened.length > 0, null, { timeout: 10000 }).catch(() => undefined);
+    const viaApi = await page.evaluate(() => window.__mock.opened.slice().pop());
+    const expected = await page.evaluate(() => window.__mock.summarySid("模切20261001001"));
+    check("视图数据里关联字段只有数量时，向明道查询明细的关联记录后打开", viaApi && viaApi.recordId === expected && viaApi.worksheetId === "ws_summary", JSON.stringify(viaApi));
+  } catch (error) { check("13d 查询关联记录（步骤异常）", false, String(error.message).split("\n")[0]); }
+  await page.close();
+  page = await open(browser, "latency=300&nosummary=1");
+  try {
+    await clickCard(page, "联动线");
+    await page.click(".scheduled-board .print-schedule-trigger");
+    await page.waitForTimeout(300);
+    const noField = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
+    check("表里没有“排程汇总表”字段时提示，不报错", /未找到“排程汇总表”字段/.test(noField) && page.__errors.length === 0, noField);
+  } catch (error) { check("13e 没有字段（步骤异常）", false, String(error.message).split("\n")[0]); }
+  await page.close();
+
+  // ---------- 14. 合并分拆只列本条记录机床上的记录；分拆出的记录在原机床上 ----------
+  page = await open(browser, "latency=300&splitmachine=打包");
+  try {
+    await clickCard(page, "上油");
+    const srcOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[0];
+    // 同一订单在其他工序/机床上的记录：“打包”工序 1 条、同工序“覆膜”机床 1 条——都不是拆出来的
+    await page.evaluate((order) => {
+      const source = Array.from(window.__mock.store.values()).find((r) => r.c_order === order);
+      window.__mock.store.set("r9001", { ...source, rowid: "r9001", c_process: "打包", c_machine: "打包", c_qty: "10000", c_pre: "10000" });
+      window.__mock.store.set("r9002", { ...source, rowid: "r9002", c_machine: "覆膜", c_qty: "777", c_pre: "777" });
+    }, srcOrder);
+    const srcIndex = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(srcOrder);
+    const srcRow = page.locator(".unscheduled-board .schedule-row").nth(srcIndex);
+    const srcQty = Number(await srcRow.locator(".quantity-cell input").inputValue());
+    await srcRow.locator(".split-icon").click();
+    await page.fill(".split-modal input", String(srcQty - 100));
+    await page.click(".split-modal .primary");
+    await waitIdle(page);
+    await page.waitForFunction(() => !document.querySelector(".pending-row"), null, { timeout: 15000 }).catch(() => undefined);
+    await waitIdle(page);
+    const pieces14 = await page.evaluate((order) => Array.from(window.__mock.store.values()).filter((r) => r.c_order === order).map((r) => ({ id: r.rowid, process: r.c_process, machine: r.c_machine, qty: Number(r.c_qty) })), srcOrder);
+    const newPiece = pieces14.find((p) => !["r9001", "r9002"].includes(p.id) && p.qty === 100);
+    const notice14 = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
+    check("分拆工作流把新记录建在别的机床（打包）上时，插件改回原记录的机床（上油）", newPiece && newPiece.machine === "上油" && newPiece.process === "表面处理" && !/还未生成|失败/.test(notice14), `${JSON.stringify(pieces14)}；${notice14}`);
+    const uiOrders14 = await columnValues(page, "unscheduled-board", "生产单号");
+    check("拆出的记录显示在原机床（上油）卡片里", uiOrders14.filter((o) => o === srcOrder).length === 2, uiOrders14.filter((o) => o === srcOrder).length + " 条");
+    const srcIndex2 = (await columnValues(page, "unscheduled-board", "生产单号")).indexOf(srcOrder);
+    await page.locator(".unscheduled-board .schedule-row").nth(srcIndex2).locator(".merge-icon").click();
+    await page.waitForSelector(".merge-modal");
+    const merge14 = await page.evaluate(() => ({
+      machine: (document.querySelector(".merge-modal .merge-machine") || {}).textContent || "",
+      items: Array.from(document.querySelectorAll(".merge-modal .merge-item")).map((el) => ({ label: el.querySelector("span").textContent, qty: el.querySelector("b").textContent, checked: el.querySelector("input").checked }))
+    }));
+    check("合并弹窗显示本记录的机床（上油）", merge14.machine === "上油", merge14.machine);
+    check("合并列表只列本记录机床上拆出的记录（不含同订单的“打包”工序、“覆膜”机床记录）", merge14.items.length === 1 && merge14.items[0].qty === "100" && merge14.items[0].label.startsWith("上油") && merge14.items[0].checked, JSON.stringify(merge14.items));
+    await page.click(".merge-modal .secondary");
+    check("页面无脚本错误（合并只限本机床）", page.__errors.length === 0, page.__errors.join(" | "));
+  } catch (error) { check("14 合并只限本机床（步骤异常）", false, String(error.message).split("\n")[0]); }
   await page.close();
 
   const failed = results.filter((r) => !r.ok);
