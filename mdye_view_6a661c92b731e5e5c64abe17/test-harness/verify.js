@@ -539,6 +539,79 @@ async function waitIdle(page, timeout = 20000) {
   check("页面无脚本错误（合并）", page.__errors.length === 0, page.__errors.join(" | "));
   await page.close();
 
+  // ---------- 9. 碰线合并卡片 + 更换机床 ----------
+  page = await open(browser);
+  const groups9 = await cardsOf(page);
+  const pengGroup = groups9.find((group) => group.process === "碰线");
+  check("碰线和新碰线+喷码合成一张“碰线”卡片（5+2=7）", pengGroup && pengGroup.cards.length === 1 && pengGroup.cards[0].name === "碰线" && pengGroup.cards[0].queued === 7 && pengGroup.cards[0].family, pengGroup && pengGroup.cards.map((c) => `${c.name}(${c.queued})`).join(" "));
+  const notice = () => page.$eval(".notice", (el) => el.textContent).catch(() => "");
+  const storeBy = (orders) => page.evaluate((list) => list.map((o) => { const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o); return { machine: r.c_machine, process: r.c_process, status: r.c_status }; }), orders);
+  const cardCount = async (name) => (await cardsOf(page)).flatMap((g) => g.cards).find((c) => c.name === name);
+
+  // 未排程：覆膜 → 上油
+  await clickCard(page, "覆膜");
+  await page.click(".unscheduled-board .change-machine-trigger");
+  check("未勾选时点“更换机床”提示先勾选", /请先勾选/.test(await notice()), await notice());
+  const rows9 = page.locator(".unscheduled-board .schedule-row");
+  const changeOrders = (await columnValues(page, "unscheduled-board", "生产单号")).slice(0, 2);
+  await rows9.nth(0).locator(".check-cell input").check();
+  await rows9.nth(1).locator(".check-cell input").check();
+  check("按钮显示勾选条数", (await page.textContent(".unscheduled-board .change-machine-trigger")) === "更换机床 (2)");
+  await page.click(".unscheduled-board .change-machine-trigger");
+  await page.waitForSelector(".machine-change-modal");
+  const changeOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value));
+  check("可选机床只有同工序（表面处理）的其他机床", JSON.stringify(changeOptions) === JSON.stringify(["大五色印刷+上油", "上油", "贴面机"]), changeOptions.join("、"));
+  await page.selectOption(".machine-change-modal select", "上油");
+  await page.click(".machine-change-modal .primary");
+  await page.waitForTimeout(80);
+  const fuMo = await cardCount("覆膜");
+  const shangYou = await cardCount("上油");
+  check("确认后立即：覆膜 3→1，上油 9→11", fuMo.queued === 1 && shangYou.queued === 11, `覆膜 ${fuMo.queued}，上油 ${shangYou.queued}`);
+  await waitIdle(page);
+  const changedStored = await storeBy(changeOrders);
+  check("已保存：机床改为上油，工序、状态不变", changedStored.every((r) => r.machine === "上油" && r.process === "表面处理" && r.status.includes("k_queued")), JSON.stringify(changedStored));
+
+  // 已排程：平模机 → 联动线开槽（同为模切），状态保持已排程
+  await clickCard(page, "平模机");
+  const schedOrder = (await columnValues(page, "scheduled-board", "生产单号"))[0];
+  await page.locator(".scheduled-board .schedule-row").first().locator(".check-cell input").check();
+  await page.click(".scheduled-board .change-machine-trigger");
+  const schedOptions = await page.$$eval(".machine-change-modal select option", (els) => els.map((el) => el.value));
+  check("已排程也能更换，选项为模切工序的其他机床", JSON.stringify(schedOptions) === JSON.stringify(["联动线开槽"]), schedOptions.join("、"));
+  await page.click(".machine-change-modal .primary");
+  await page.waitForTimeout(80);
+  check("已排程任务立即移到联动线卡片（已排程 5→6）", (await cardCount("平模机")).scheduled === 1 && (await cardCount("联动线")).scheduled === 6);
+  await waitIdle(page);
+  const schedStored = await storeBy([schedOrder]);
+  check("已保存：机床=联动线开槽，工序=模切，仍为已排程", schedStored[0].machine === "联动线开槽" && schedStored[0].process === "模切" && schedStored[0].status.includes("k_scheduled"), JSON.stringify(schedStored[0]));
+
+  // 勾选了不同工序的任务 → 提示分别更换
+  await clickCard(page, "联动线");
+  await page.click(".unscheduled-board .select-menu-trigger");
+  await page.click(".unscheduled-board .select-menu button:text-is('全选')");
+  await page.click(".unscheduled-board .change-machine-trigger");
+  check("勾选跨工序时提示按工序分别更换", /不同工序/.test(await notice()) && !(await page.$(".machine-change-modal")), await notice());
+  await page.click(".unscheduled-board .select-menu-trigger");
+  await page.click(".unscheduled-board .select-menu button:text-is('全不选')");
+
+  // 碰线卡片内更换（碰线 → 新碰线+喷码），失败时恢复
+  await clickCard(page, "碰线");
+  const pengOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[0];
+  await page.locator(".unscheduled-board .schedule-row").first().locator(".check-cell input").check();
+  await page.click(".unscheduled-board .change-machine-trigger");
+  await page.selectOption(".machine-change-modal select", "新碰线+喷码");
+  await page.evaluate(() => { window.__mock.failNext = 1; });
+  await page.click(".machine-change-modal .primary");
+  await page.waitForTimeout(80);
+  const machineNow = (await columnValues(page, "unscheduled-board", "机床"))[(await columnValues(page, "unscheduled-board", "生产单号")).indexOf(pengOrder)];
+  check("合并卡片内更换：留在碰线卡片，机床列立即变为新机床", machineNow === "新碰线+喷码", machineNow);
+  await waitIdle(page);
+  const machineAfterFail = (await columnValues(page, "unscheduled-board", "机床"))[(await columnValues(page, "unscheduled-board", "生产单号")).indexOf(pengOrder)];
+  check("保存失败时恢复为原机床并提示", machineAfterFail === "碰线" && (await storeBy([pengOrder]))[0].machine === "碰线" && /已恢复/.test(await notice()), `${machineAfterFail}；${await notice()}`);
+  check("页面无脚本错误（更换机床）", page.__errors.length === 0, page.__errors.join(" | "));
+  await page.screenshot({ path: path.join(__dirname, "shot-change.png") });
+  await page.close();
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} passed`);
   await browser.close();

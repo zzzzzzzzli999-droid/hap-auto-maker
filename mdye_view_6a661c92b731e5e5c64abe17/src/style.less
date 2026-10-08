@@ -58,6 +58,10 @@ button { color: inherit; }
 .merge-machine-trigger { min-width: 82px; height: 26px; padding: 0 11px; color: #176348; border: 1px solid #73b495; border-radius: 3px; background: #edf9f2; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
 .merge-machine-trigger:hover { color: #fff; background: #27875e; }
 .merge-machine-trigger:disabled { cursor: wait; opacity: .58; }
+/* 更换机床：勾选任务后换到同工序的其他机床 */
+.change-machine-trigger { flex: none; height: 26px; padding: 0 10px; color: #1d5d86; border: 1px solid #8ebbd5; border-radius: 3px; background: #f5fbff; cursor: pointer; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.change-machine-trigger:hover, .change-machine-trigger:focus-visible { color: #fff; background: #2d86c3; border-color: #1d70aa; outline: none; }
+.split-modal label strong.machine-change-current { max-width: 230px; overflow: hidden; color: #315c78; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 
 .notice { position: fixed; top: 8px; left: 50%; z-index: 200; max-width: min(680px, 70vw); padding: 6px 14px; overflow: hidden; color: #77521b; background: #fff5da; border: 1px solid #e4cf99; border-radius: 3px; box-shadow: 0 5px 16px rgba(89, 69, 30, .16); text-overflow: ellipsis; white-space: nowrap; font-size: 11px; pointer-events: none; transform: translateX(-50%); }
 .boards { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(280px, var(--left-width, 39%)) 8px minmax(280px, 1fr); grid-template-rows: minmax(0, 1fr); gap: 0; }

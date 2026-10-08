@@ -63,7 +63,8 @@ const DEFAULT_MACHINE = "联动线印刷+开槽";
 // 明细表显示“机床”列，拖拽/排序时每条任务仍写回它原本的工序和机床。
 const MACHINE_FAMILIES = [
   { match: "大五色", name: "大五色印刷", homeProcess: "印刷" },
-  { match: "联动线", name: "联动线", homeProcess: "印刷" }
+  { match: "联动线", name: "联动线", homeProcess: "印刷" },
+  { match: "碰线", name: "碰线", homeProcess: "碰线" }
 ];
 const FAMILY_KEY_PREFIX = "FAMILY::";
 const MACHINE_COLUMN = { key: "machine", label: "机床", width: 150, locked: true };
@@ -891,6 +892,8 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [mergeTarget, setMergeTarget] = useState(null);
   const [mergePicked, setMergePicked] = useState([]);
+  // 更换机床：{ lane, rowIds, process, target }
+  const [machineChange, setMachineChange] = useState(null);
   const [detailField, setDetailField] = useState(null);
   const [draggedColumn, setDraggedColumn] = useState(null);
   const [columnLayout, setColumnLayout] = useState(() => {
@@ -1321,6 +1324,75 @@ export default function App() {
     setQueuedFilters((current) => hasActiveFilters(current) ? {} : current);
     setScheduledFilters((current) => hasActiveFilters(current) ? {} : current);
     setSelectedRowIds((current) => current.length ? [] : current);
+  };
+
+  // 每个工序下有哪些机床（按机床序号、名称排列），用于“更换机床”只能选同工序的机床
+  const machinesByProcess = useMemo(() => {
+    const byProcess = new Map();
+    rows.forEach((row) => {
+      if (row.__pending || !row.machine || row.machine === "未指定机床") return;
+      if (!byProcess.has(row.process)) byProcess.set(row.process, new Map());
+      const machines = byProcess.get(row.process);
+      machines.set(row.machine, Math.min(machines.has(row.machine) ? machines.get(row.machine) : 999999, Number(row.machineSequence) || 999999));
+    });
+    return new Map(Array.from(byProcess.entries()).map(([process, machines]) => [process,
+      Array.from(machines.entries()).sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0], "zh-CN", { numeric: true })).map(([name]) => name)]));
+  }, [machineGroupSignature]);
+
+  // 更换机床：把当前栏里勾选的任务换到同工序的另一台机床，工序、状态、排程顺序不变。
+  const openMachineChange = (lane) => {
+    const laneRows = lane === "queued" ? unscheduled : scheduled;
+    const picked = laneRows.filter((row) => selectedRowIdSet.has(row.rowid) && !row.__pending);
+    if (!picked.length) {
+      setNotice("请先勾选要更换机床的任务");
+      return;
+    }
+    const processes = Array.from(new Set(picked.map((row) => row.process)));
+    if (processes.length > 1) {
+      setNotice(`勾选的任务属于不同工序（${processes.join("、")}），请按工序分别更换`);
+      return;
+    }
+    const options = (machinesByProcess.get(processes[0]) || []).filter((name) => picked.some((row) => row.machine !== name));
+    if (!options.length) {
+      setNotice(`工序“${processes[0]}”下没有其他机床可更换`);
+      return;
+    }
+    setMachineChange({ lane, rowIds: picked.map((row) => row.rowid), process: processes[0], target: options[0] });
+  };
+
+  const confirmMachineChange = () => {
+    if (!machineChange) return;
+    const machineControl = resolveField("machine");
+    if (!machineControl) {
+      setNotice("请先在插件设置中映射机床字段");
+      return;
+    }
+    const target = machineChange.target;
+    const picked = rows.filter((row) => machineChange.rowIds.includes(row.rowid) && row.machine !== target && !isVirtualRow(row));
+    setMachineChange(null);
+    if (!picked.length) return;
+    let encodedMachine;
+    try { encodedMachine = encodeValue(machineControl, target); }
+    catch (error) { setNotice(`更换机床失败：${error.message}`); return; }
+    const optimistic = applyOptimistic(new Map(picked.map((row) => [row.rowid, { machine: target }])));
+    const pickedIds = new Set(picked.map((row) => row.rowid));
+    setSelectedRowIds((current) => current.filter((rowId) => !pickedIds.has(rowId)));
+    const stays = picked.every((row) => machineCardKey({ ...row, machine: target }) === activeMachineKey) || activeMachineKey === "ALL";
+    setNotice(`已将 ${picked.length} 条任务更换到“${target}”${stays ? "" : "，可在对应机床卡片中查看"}`);
+    enqueueSync(() => runConcurrently(picked.map((row) => () => updateRow({
+      appId, worksheetId, viewId, rowId: row.rowid,
+      newOldControl: [{ controlId: machineControl.controlId, controlName: machineControl.controlName, type: machineControl.type, value: encodedMachine }]
+    }))))
+      .then(() => optimistic.saved())
+      .catch((error) => {
+        optimistic.rollback();
+        setNotice(`更换机床失败，已恢复：${error.message || "请检查机床字段权限"}`);
+      });
+  };
+
+  const changeMachineButton = (lane, laneRows) => {
+    const count = selectedVisibleCount(laneRows);
+    return <button type="button" className="change-machine-trigger" onClick={() => openMachineChange(lane)} title={count ? `把勾选的 ${count} 条任务更换到同工序的其他机床` : "先勾选任务，再更换到同工序的其他机床"}>更换机床{count ? ` (${count})` : ""}</button>;
   };
 
   const openMachineMerge = () => {
@@ -2061,7 +2133,7 @@ export default function App() {
 
       <section className={`boards ${hiddenPane ? `hide-${hiddenPane}` : ""}`} ref={boardsRef} style={{ "--left-width": `${leftWidth}%` }}>
         <div className={`board unscheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("queued", e)}>
-          <div className="board-head"><div>{maximizeButton("queued", "未排程")}<span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{selectedVisibleCount(unscheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(unscheduled)}</em>}{activeMachineInfo && mergeTargetMachines.length > 0 && <button className="merge-machine-trigger" onClick={openMachineMerge}>合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button className="select-visible" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}>{unscheduled.length && selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("queued")} disabled={!unscheduled.length}><span>⇅</span> 自动排序</button></div></div>
+          <div className="board-head"><div>{maximizeButton("queued", "未排程")}<span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{selectedVisibleCount(unscheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(unscheduled)}</em>}{changeMachineButton("queued", unscheduled)}{activeMachineInfo && mergeTargetMachines.length > 0 && <button className="merge-machine-trigger" onClick={openMachineMerge}>合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button className="select-visible" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}>{unscheduled.length && selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("queued")} disabled={!unscheduled.length}><span>⇅</span> 自动排序</button></div></div>
           <div className="list-table">
             <div className="list-head" style={queuedTableStyle}><SelectAllHeader key="check" total={unscheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(unscheduled)} onSelectAll={() => setLaneChecked(unscheduled, true)} onClear={() => setLaneChecked(unscheduled, false)} />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={queuedFilters[fieldKeys[index]]} options={() => queuedColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("queued", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
             <VirtualCardList rows={unscheduled} resetKey={activeMachineKey} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} selected={selectedRowIdSet.has(row.rowid)} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty"><strong>没有未排程任务</strong><span>当前机床暂无可排程订单</span></div>} />
@@ -2071,7 +2143,7 @@ export default function App() {
         <div className="board-splitter" onPointerDown={beginResize} onDoubleClick={togglePanes} title={hiddenPane ? "双击还原左右两栏" : "拖动调整左右区域宽度；双击隐藏/还原左右区域"}><span /></div>
 
         <div className={`board scheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("scheduled", e)}>
-          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}</div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button className="select-visible" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}>{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><span>⇅</span> 自动排序</button><button className="confirm-schedule" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><span>✓</span>{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
+          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}{changeMachineButton("scheduled", scheduled)}</div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button className="select-visible" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}>{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><span>⇅</span> 自动排序</button><button className="confirm-schedule" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><span>✓</span>{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
           <div className="list-table">
             <div className="list-head" style={tableStyle}><SelectAllHeader key="check" total={scheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(scheduled)} onSelectAll={() => setLaneChecked(scheduled, true)} onClear={() => setLaneChecked(scheduled, false)} /><FilterHeader key="sequence" columnKey="__sequence" label="序号" value={scheduledFilters.sequence} options={() => scheduledColumnOptions("sequence")} onChange={(value) => setColumnFilter("scheduled", "sequence", value)} layoutLocked />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={scheduledFilters[fieldKeys[index]]} options={() => scheduledColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("scheduled", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
             <VirtualCardList rows={scheduled} resetKey={activeMachineKey} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} scheduled selected={selectedRowIdSet.has(row.rowid)} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty drop-empty"><strong>拖到这里开始排程</strong><span>任务会自动生成排程序号</span></div>} />
@@ -2084,6 +2156,21 @@ export default function App() {
       {confirmStartTime && <div className="modal-backdrop" onMouseDown={() => !confirmingSchedule && setConfirmStartTime("")}><div className="split-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title">确定排程时间</div><p className="modal-record">将从指定时间开始，按每条任务的张/分钟和换版时间连续计算开始、结束时间。</p><label>排程开始时间<input autoFocus type="datetime-local" step="60" value={confirmStartTime} onChange={(event) => setConfirmStartTime(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirmSchedule(confirmStartTime); }} /></label><p className="split-hint">默认值为明天上午 08:00。不同机床会分别从该时间开始计算；缺少张/分钟的任务只计入换版时间。</p><div className="modal-actions"><button className="secondary" onClick={() => setConfirmStartTime("")} disabled={confirmingSchedule}>取消</button><button className="primary" onClick={() => confirmSchedule(confirmStartTime)} disabled={confirmingSchedule}>{confirmingSchedule ? "计算并提交中…" : "计算时间并确定排程"}</button></div></div></div>}
 
       {machineMergeTargetKey !== null && activeMachineInfo && activeMachineGroup && <div className="modal-backdrop" onMouseDown={() => setMachineMergeTargetKey(null)}><div className="split-modal machine-merge-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title">合并机床</div><p className="modal-record">仅合并同一工序内的机床任务，工序字段不会变更。</p><label>当前工序<strong>{activeMachineGroup.name}</strong></label><label>来源机床<strong>{activeMachineInfo.name}</strong></label><label>合并到<select value={machineMergeTargetKey} onChange={(event) => setMachineMergeTargetKey(event.target.value)}>{mergeTargetMachines.map((machine) => <option key={machine.key} value={machine.key}>{machine.name}</option>)}</select></label><p className="split-hint">确认后将把“{activeMachineInfo.name}”下的 {activeMachineInfo.count} 条任务批量转移到目标机床，任务所属工序保持为“{activeMachineGroup.name}”。</p><div className="modal-actions"><button className="secondary" onClick={() => setMachineMergeTargetKey(null)}>取消</button><button className="primary" onClick={confirmMachineMerge}>确认合并</button></div></div></div>}
+
+      {machineChange && (() => {
+        const picked = rows.filter((row) => machineChange.rowIds.includes(row.rowid));
+        const current = Array.from(picked.reduce((map, row) => map.set(row.machine, (map.get(row.machine) || 0) + 1), new Map()).entries());
+        const options = (machinesByProcess.get(machineChange.process) || []).filter((name) => picked.some((row) => row.machine !== name));
+        return <div className="modal-backdrop" onMouseDown={() => setMachineChange(null)}><div className="split-modal machine-change-modal" onMouseDown={(event) => event.stopPropagation()}>
+          <div className="modal-title">更换机床</div>
+          <p className="modal-record">{machineChange.lane === "queued" ? "未排程" : "已排程"}中勾选的 {picked.length} 条任务</p>
+          <label>工序<strong>{machineChange.process}</strong></label>
+          <label>当前机床<strong className="machine-change-current">{current.map(([name, count]) => `${name}（${count}）`).join("、")}</strong></label>
+          <label>更换为<select value={machineChange.target} onChange={(event) => setMachineChange((old) => ({ ...old, target: event.target.value }))}>{options.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
+          <p className="split-hint">只能更换为同工序的机床；任务的工序、状态和排程顺序不变。</p>
+          <div className="modal-actions"><button className="secondary" onClick={() => setMachineChange(null)}>取消</button><button className="primary" onClick={confirmMachineChange}>确认更换</button></div>
+        </div></div>;
+      })()}
 
       {mergeTarget && (() => {
         const target = rows.find((row) => row.rowid === mergeTarget.rowid) || mergeTarget;
