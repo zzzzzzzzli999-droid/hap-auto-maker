@@ -20,6 +20,7 @@
   { "controlId": "specModel", "name": "规格型号字段（兼容旧配置，不再显示）", "type": "control" },
   { "controlId": "requiredQuantity", "name": "要求量字段", "type": "control", "required": true },
   { "controlId": "productionQuantity", "name": "生产量字段", "type": "control", "required": true },
+  { "controlId": "corrugatedQuantity", "name": "瓦量字段", "type": "control" },
   { "controlId": "quantity", "name": "数量字段", "type": "control" },
   { "controlId": "productionSize", "name": "生产尺寸字段", "type": "control", "required": true },
   { "controlId": "color", "name": "颜色字段（用于自动排序）", "type": "control" },

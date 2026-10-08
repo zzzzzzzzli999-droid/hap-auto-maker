@@ -33,7 +33,8 @@
     { controlId: "c_date", controlName: "生产交期", type: 15 },
     { controlId: "c_color", controlName: "颜色", type: 2 },
     { controlId: "c_die", controlName: "模切版", type: 2 },
-    { controlId: "c_print", controlName: "印刷版", type: 2 }
+    { controlId: "c_print", controlName: "印刷版", type: 2 },
+    { controlId: "c_wa", controlName: "瓦量", type: 6 }
   ];
   window.env = {
     process: "c_process", machine: "c_machine", machineSequence: "c_mseq", scheduleStatus: "c_status",
@@ -75,7 +76,7 @@
         c_name: ["320g大青盐加碘纸箱", "2.25kg餐饮原味", "160g番茄火锅", "周转箱", "300g精制湖盐"][id % 5], c_size: `${400 + (id * 7) % 60}*${300 + id % 3 * 10}*180`,
         c_req: String(qty), c_prod: String(qty), c_remark: "", c_start: "", c_end: "", c_rate: String(60 + id % 40),
         c_date: `2026-10-${String(10 + id % 4).padStart(2, "0")}${id % 7 === 0 ? " 15:30" : ""}`, c_color: ["红", "蓝", "黑", "四色"][id % 4],
-        c_die: `D${id % 3}`, c_print: `P${id % 2}`
+        c_die: `D${id % 3}`, c_print: `P${id % 2}`, c_wa: String(qty * 2 + 7)
       });
     };
     for (let s = 0; s < queued * ROW_SCALE; s += 1) make("k_queued", 0);

@@ -39,6 +39,8 @@ const FIELD_ALIASES = {
   specModel: ["specModel", "规格型号", "规格", "型号"],
   requiredQuantity: ["requiredQuantity", "要求量", "需求量"],
   productionQuantity: ["productionQuantity", "生产量", "生产数量", "数量"],
+  // 瓦量：插件设置里可映射；未映射时按字段名“瓦量”自动识别
+  corrugatedQuantity: ["corrugatedQuantity", "瓦量", "瓦楞量"],
   quantity: ["quantity", "数量", "生产数量"],
   productionSize: ["productionSize", "生产尺寸", "产品尺寸"],
   color: ["color", "颜色", "生产颜色", "印刷颜色"],
@@ -109,6 +111,7 @@ const DEFAULT_COLUMNS = [
   { key: "preSplitScheduleQuantity", label: "拆前数量", width: 110 },
   { key: "scheduleQuantity", label: "排产量", width: 145 },
   { key: "productionQuantity", label: "生产量", width: 110 },
+  { key: "corrugatedQuantity", label: "瓦量", width: 110 },
   { key: "scheduleStartTime", label: "开始时间", width: 150 },
   { key: "scheduleEndTime", label: "结束时间", width: 150 },
   { key: "processRequirement", label: "工艺要求", width: 220 },
@@ -316,6 +319,7 @@ function normalizeRow(row) {
     specModel: cleanText(fieldValue(row, "specModel")) || cleanText(fieldValue(row, "productName")) || "—",
     requiredQuantity: cleanText(fieldValue(row, "requiredQuantity")) || "—",
     productionQuantity: cleanText(fieldValue(row, "productionQuantity")) || cleanText(fieldValue(row, "quantity")) || "—",
+    corrugatedQuantity: cleanText(fieldValue(row, "corrugatedQuantity")) || "—",
     quantity: cleanText(fieldValue(row, "quantity")) || "—",
     productionSize: cleanText(fieldValue(row, "productionSize")) || "—",
     color: cleanText(fieldValue(row, "color")) || "—",
@@ -900,7 +904,13 @@ export default function App() {
         keys.forEach((key) => { if (!migratedKeys.includes(key)) migratedKeys.push(key); });
       });
       const ordered = migratedKeys.map((key) => DEFAULT_COLUMNS.find((item) => item.key === key)).filter(Boolean);
-      DEFAULT_COLUMNS.forEach((column) => { if (!ordered.some((item) => item.key === column.key)) ordered.push(column); });
+      // 新增的默认列（如“瓦量”）插在它默认位置的前一列后面，而不是追加到最后
+      DEFAULT_COLUMNS.forEach((column, defaultIndex) => {
+        if (ordered.some((item) => item.key === column.key)) return;
+        const previousKey = defaultIndex > 0 ? DEFAULT_COLUMNS[defaultIndex - 1].key : null;
+        const previousIndex = previousKey ? ordered.findIndex((item) => item.key === previousKey) : -1;
+        ordered.splice(previousIndex < 0 ? ordered.length : previousIndex + 1, 0, column);
+      });
       return ordered.map((column) => {
         const savedWidth = Number(savedMap.get(column.key)?.width);
         return { ...column, width: Number.isFinite(savedWidth) ? Math.max(0, Math.min(500, savedWidth)) : column.width };

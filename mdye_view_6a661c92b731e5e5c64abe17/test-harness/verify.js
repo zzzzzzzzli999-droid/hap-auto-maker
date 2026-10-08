@@ -104,6 +104,16 @@ async function waitIdle(page, timeout = 20000) {
   await page.keyboard.press("Escape");
   await page.mouse.click(5, 790);
 
+  // 瓦量列：按字段名“瓦量”自动识别（mock 中未映射），位于“生产量”之后
+  const waInfo = await page.evaluate(() => {
+    const headers = Array.from(document.querySelectorAll(".unscheduled-board .list-head > *")).map((el) => el.textContent.replace(/[▼⋮]/g, "").trim());
+    return { headers, waIndex: headers.indexOf("瓦量"), prodIndex: headers.indexOf("生产量") };
+  });
+  const waValues = await columnValues(page, "unscheduled-board", "瓦量");
+  const qtyForWa = await page.evaluate(() => Array.from(document.querySelectorAll(".unscheduled-board .schedule-row")).map((row) => row.querySelector(".quantity-cell input").value));
+  check("新增“瓦量”列，紧跟在“生产量”后面", waInfo.waIndex > 0 && waInfo.waIndex === waInfo.prodIndex + 1, `第 ${waInfo.waIndex} 列`);
+  check("“瓦量”列显示明道云瓦量字段的值", waValues && waValues.length > 0 && waValues.every((v, i) => v === String(Number(qtyForWa[i]) * 2 + 7)), waValues && waValues.slice(0, 3).join(", "));
+
   // ---------- 2. 操作无卡顿（乐观更新） ----------
   // 2a 拖拽：合并卡片内拖到右侧，机床保持原值
   const target = await page.evaluate(() => {
@@ -292,6 +302,19 @@ async function waitIdle(page, timeout = 20000) {
   check("还原后左右宽度与之前一致", Math.abs(states[2].leftWidth - widthBefore) <= 1 && Math.abs(states[4].leftWidth - widthBefore) <= 1, `${widthBefore} / ${states[2].leftWidth} / ${states[4].leftWidth}`);
 
   check("页面无脚本错误", page.__errors.length === 0, page.__errors.join(" | "));
+  await page.close();
+
+  // 已保存过列顺序（旧版本、没有瓦量列）时，瓦量列插在生产量后面而不是最后
+  page = await open(browser);
+  await page.evaluate(() => {
+    const key = "machine-scheduler:columns:app1:ws1:view1";
+    localStorage.setItem(key, JSON.stringify(["productName", "customer", "orderNo", "productCode", "deliveryDate", "productionSize", "requiredQuantity", "preSplitScheduleQuantity", "scheduleQuantity", "productionQuantity", "scheduleStartTime", "scheduleEndTime", "processRequirement", "processRemark", "productionRequirement"].map((k) => ({ key: k, width: 120 }))));
+  });
+  await page.reload();
+  await page.waitForFunction(() => document.querySelectorAll(".schedule-row").length > 0);
+  const migrated = await page.evaluate(() => Array.from(document.querySelectorAll(".unscheduled-board .list-head > *")).map((el) => el.textContent.replace(/[▼⋮]/g, "").trim()).filter(Boolean));
+  check("旧的列顺序设置：保留原顺序，瓦量插在生产量后面", migrated[1] === "产品名称" && migrated.indexOf("瓦量") === migrated.indexOf("生产量") + 1, migrated.slice(0, 14).join(","));
+  await page.evaluate(() => localStorage.clear());
   await page.close();
 
   // ---------- 5. 自动排序规则 ----------
