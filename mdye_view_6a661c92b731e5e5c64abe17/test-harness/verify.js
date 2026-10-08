@@ -156,7 +156,7 @@ async function waitIdle(page, timeout = 20000) {
   const stored = await page.evaluate((id) => ({ ...window.__mock.store.get(id) }), rowid);
   const dragCalls = await page.evaluate((n) => window.__mock.calls.slice(n).filter((c) => c.action === "updateWorksheetRow"), callsBefore);
   check("保存到明道云：状态=已排程，机床/工序未改动", stored.c_status === JSON.stringify(["k_scheduled"]) && stored.c_machine === "大五色印刷+圆模" && stored.c_process === "印刷", `${stored.c_status} ${stored.c_process}/${stored.c_machine}`);
-  check("拖拽只写状态和排程序号（不写机床/工序字段）", dragCalls.length === 1 && dragCalls[0].data.newOldControl.every((c) => ["c_status", "c_seq"].includes(c.controlId)), JSON.stringify(dragCalls.map((c) => c.data.newOldControl.map((x) => x.controlId))));
+  check("拖拽只写状态和排程序号（不写机床/工序/排程单号）", dragCalls.length === 1 && dragCalls[0].data.newOldControl.every((c) => ["c_status", "c_seq"].includes(c.controlId)), JSON.stringify(dragCalls.map((c) => c.data.newOldControl.map((x) => x.controlId))));
   check("保存期间整页没有进入忙碌状态", !(await page.evaluate(() => window.__busySeen)));
   check("保存期间“自动排序”按钮不被禁用", !(await page.evaluate(() => window.__disabledSort)));
   check("刷新后记录仍在右侧（未跳回）", (await columnValues(page, "scheduled-board", "机床"))?.length === 1);
@@ -635,6 +635,82 @@ async function waitIdle(page, timeout = 20000) {
   const tieAfter = await Promise.all(tieOrders.map((o) => relMachine(o)));
   check("合并机床：按关联记录格式写入", tieAfter.every((m) => m.name === "上油" && m.sid === m.expected), JSON.stringify(tieAfter.map((m) => m.name)));
   check("页面无脚本错误（关联记录模式）", page.__errors.filter((e) => !/参数格式错误/.test(e)).length === 0, page.__errors.join(" | "));
+  await page.close();
+
+  // ---------- 11. 排程单号 ----------
+  page = await open(browser);
+  const today = await page.evaluate(() => { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`; });
+  const snoOf = (orders) => page.evaluate((list) => list.map((o) => Array.from(window.__mock.store.values()).find((x) => x.c_order === o).c_sno), orders);
+  // 拖入已排程不生成；拖回未排程清空
+  await clickCard(page, "大五色印刷");
+  const dwOrders = (await columnValues(page, "unscheduled-board", "生产单号")).slice(0, 2);
+  await page.locator(".unscheduled-board .schedule-row").nth(0).locator(".check-cell input").check();
+  await page.locator(".unscheduled-board .schedule-row").nth(1).locator(".check-cell input").check();
+  await page.locator(".unscheduled-board .schedule-row").nth(0).dragTo(page.locator(".scheduled-board .card-list"));
+  await waitIdle(page);
+  check("拖入已排程时不生成排程单号", (await snoOf(dwOrders)).every((v) => v === "") && (await columnValues(page, "scheduled-board", "排程单号")).every((v) => v === "—"), JSON.stringify(await snoOf(dwOrders)));
+  // 平模机：已排程里有之前的单号（模切20261001001），拖回一条到未排程 → 清空
+  await clickCard(page, "平模机");
+  const oldOrder = (await columnValues(page, "scheduled-board", "生产单号"))[0];
+  check("之前已排程的记录带有旧单号", (await snoOf([oldOrder]))[0] === "模切20261001001");
+  await page.locator(".scheduled-board .schedule-row").first().dragTo(page.locator(".unscheduled-board .card-list"));
+  await page.waitForTimeout(100);
+  const clearedUi = (await columnValues(page, "unscheduled-board", "排程单号"))[(await columnValues(page, "unscheduled-board", "生产单号")).indexOf(oldOrder)];
+  await waitIdle(page);
+  check("拖回未排程：排程单号立即清空并同步明道云", clearedUi === "—" && (await snoOf([oldOrder]))[0] === "", `${clearedUi} / ${JSON.stringify(await snoOf([oldOrder]))}`);
+  await clickCard(page, "联动线");
+  // 再拖一条新任务进来，然后确定排程：旧的 + 新的 统一成一个新单号（工序+年月日+3位流水号）
+  const newOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[1];
+  await page.locator(".unscheduled-board .schedule-row").nth(1).dragTo(page.locator(".scheduled-board .card-list"));
+  await waitIdle(page);
+  await page.evaluate(() => { window.__mock.store.get("r0001").c_sno = "印刷" + (() => { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`; })() + "007"; });
+  const batchOrders = await columnValues(page, "scheduled-board", "生产单号");
+  const callsBeforeConfirm = await page.evaluate(() => window.__mock.calls.length);
+  await page.click(".scheduled-board .confirm-schedule");
+  await page.waitForSelector(".confirm-schedule-modal");
+  const preview = await page.textContent(".confirm-schedule-modal .schedule-no-preview");
+  check("确定排程弹窗预览：工序+年月日+3位流水号", new RegExp(`^印刷${today}\\d{3}$`).test(preview), preview);
+  await page.click(".confirm-schedule-modal .primary");
+  await waitIdle(page);
+  const batchNos = await snoOf(batchOrders);
+  check("确定排程后整批（旧的未生产完 + 新拖入）排程单号都一样", new Set(batchNos).size === 1 && batchNos.length === batchOrders.length, JSON.stringify(batchNos));
+  check("排程单号格式 = 印刷 + 今天日期 + 流水号，并接着表里已有的最大流水号（007 → 008）", batchNos[0] === `印刷${today}008`, batchNos[0]);
+  const confirmCalls = await page.evaluate((n) => window.__mock.calls.slice(n).map((c) => ({ a: c.action, t: c.data.triggerId, sno: (c.data.newOldControl || []).some((x) => x.controlId === "c_sno") })), callsBeforeConfirm);
+  const lastSnoWrite = confirmCalls.map((c) => c.sno).lastIndexOf(true);
+  const workflowAt = confirmCalls.findIndex((c) => c.t === "b_confirm");
+  check("排程单号全部写入之后才触发确定排程工作流", lastSnoWrite >= 0 && workflowAt > lastSnoWrite, `最后一次写单号 #${lastSnoWrite}，工作流 #${workflowAt}`);
+  const uiNos = await columnValues(page, "scheduled-board", "排程单号");
+  check("已排程列表显示同一个排程单号", uiNos.every((v) => v === batchNos[0]), uiNos.join(","));
+  // 写入失败（6 条里第 1 条失败、其余已写入）→ 已写入的改回原单号，不触发工作流，界面恢复
+  await clickCard(page, "联动线");
+  const pmOrders = await columnValues(page, "scheduled-board", "生产单号");
+  const pmBefore = await snoOf(pmOrders);
+  const callsBeforeFail = await page.evaluate(() => window.__mock.calls.length);
+  await page.click(".scheduled-board .confirm-schedule");
+  await page.waitForSelector(".confirm-schedule-modal");
+  await page.evaluate(() => { window.__mock.failControl = "c_sno"; });
+  await page.click(".confirm-schedule-modal .primary");
+  await waitIdle(page);
+  const failNoticeSno = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
+  const workflowAfterFail = await page.evaluate((n) => window.__mock.calls.slice(n).some((c) => c.data.triggerId === "b_confirm"), callsBeforeFail);
+  const pmUi = await columnValues(page, "scheduled-board", "排程单号");
+  check("排程单号写入失败：不触发确定排程，并提示", !workflowAfterFail && /排程单号写入失败，未触发确定排程/.test(failNoticeSno), failNoticeSno);
+  check("排程单号写入失败：界面恢复为原单号", pmUi.every((v, i) => v === (pmBefore[i] || "—")), `${pmUi.join(",")} / ${pmBefore.join(",")}`);
+  const pmAfterStore = await snoOf(pmOrders);
+  check("部分写入成功的记录已改回原单号（整批仍是同一个单号）", pmOrders.length >= 2 && pmAfterStore.every((v, i) => v === pmBefore[i]) && new Set(pmAfterStore).size === 1, `${pmOrders.length} 条：${[...new Set(pmAfterStore)].join(",")}`);
+  check("页面无脚本错误（排程单号）", page.__errors.length === 0, page.__errors.join(" | "));
+  await page.close();
+  // 表里没有“排程单号”字段：不能确定排程
+  page = await open(browser, "latency=300&nosno=1");
+  await clickCard(page, "联动线");
+  const callsNoField = await page.evaluate(() => window.__mock.calls.length);
+  await page.click(".scheduled-board .confirm-schedule");
+  await page.waitForSelector(".confirm-schedule-modal");
+  await page.click(".confirm-schedule-modal .primary");
+  await page.waitForTimeout(300);
+  const noFieldNotice = await page.$eval(".notice", (el) => el.textContent).catch(() => "");
+  const noFieldWorkflow = await page.evaluate((n) => window.__mock.calls.slice(n).some((c) => c.action === "startProcess"), callsNoField);
+  check("表里没有“排程单号”字段时不触发确定排程并提示", !noFieldWorkflow && /未找到“排程单号”字段/.test(noFieldNotice), noFieldNotice);
   await page.close();
 
   const failed = results.filter((r) => !r.ok);

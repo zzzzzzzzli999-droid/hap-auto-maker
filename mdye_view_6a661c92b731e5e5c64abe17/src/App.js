@@ -35,6 +35,9 @@ const FIELD_ALIASES = {
   deliveryDate: ["deliveryDate", "生产交期", "交期"],
   productCode: ["productCode", "产品编号", "产品编码"],
   orderNo: ["orderNo", "生产单号", "订单号"],
+  // 排程单号：拖入已排程时自动赋值（同一张卡片已排程的一批共用一个单号），拖回未排程时清空；
+  // 确定排程时整批统一写入，写入成功后才触发“确定排程”工作流。未映射时按字段名“排程单号”识别。
+  scheduleNo: ["scheduleNo", "排程单号", "排程编号"],
   productName: ["productName", "产品名称", "品名"],
   specModel: ["specModel", "规格型号", "规格", "型号"],
   requiredQuantity: ["requiredQuantity", "要求量", "需求量"],
@@ -104,6 +107,7 @@ function patchValueMatches(key, serverValue, localValue) {
 const DEFAULT_COLUMNS = [
   { key: "customer", label: "客户", width: 140 },
   { key: "orderNo", label: "生产单号", width: 140 },
+  { key: "scheduleNo", label: "排程单号", width: 160 },
   { key: "productCode", label: "产品编号", width: 140 },
   { key: "productName", label: "产品名称", width: 200 },
   { key: "deliveryDate", label: "生产交期", width: 120 },
@@ -316,6 +320,7 @@ function normalizeRow(row) {
     deliveryDate: cleanText(fieldValue(row, "deliveryDate")) || "—",
     productCode: cleanText(fieldValue(row, "productCode")) || "—",
     orderNo: cleanText(fieldValue(row, "orderNo")) || "—",
+    scheduleNo: cleanText(fieldValue(row, "scheduleNo")).trim(),
     productName: cleanText(fieldValue(row, "productName")) || "未命名产品",
     specModel: cleanText(fieldValue(row, "specModel")) || cleanText(fieldValue(row, "productName")) || "—",
     requiredQuantity: cleanText(fieldValue(row, "requiredQuantity")) || "—",
@@ -525,6 +530,32 @@ function compactScheduleTime(value) {
   const text = cleanText(value);
   const matched = text.match(/(?:\d{4}[-/])?(\d{2})[-/](\d{2})[ T](\d{2}):(\d{2})/);
   return matched ? `${matched[1]}-${matched[2]} ${matched[3]}:${matched[4]}` : text;
+}
+
+// 排程单号 = 工序 + 年月日（确定排程当天）+ 3 位流水号，如 印刷20261008001。
+// 只在点“确定排程”时生成；同一张机床卡片已排程的整批记录共用一个单号。
+function scheduleNoDate(date = new Date()) {
+  return `${date.getFullYear()}${padTimePart(date.getMonth() + 1)}${padTimePart(date.getDate())}`;
+}
+
+function scheduleNoSerial(value, prefix) {
+  const text = String(value || "");
+  if (!prefix || !text.startsWith(prefix)) return 0;
+  const rest = text.slice(prefix.length);
+  return /^\d{3,}$/.test(rest) ? Number(rest) : 0;
+}
+
+// 查询明道云整张表里已用过的同前缀排程单号（含已生产等不在本视图的记录），用于接着编流水号；查询失败时返回空。
+async function fetchExistingScheduleNos(control, prefix, context) {
+  try {
+    const response = await getRows(compact({
+      appId: context.appId, worksheetId: context.worksheetId, pageIndex: 1, pageSize: 1000, notGetTotal: true,
+      filterControls: [{ controlId: control.controlId, dataType: Number(control.type) || 2, spliceType: 1, filterType: 1, values: [prefix] }]
+    }));
+    return extractRows(response).map((row) => cleanText(row[control.controlId]));
+  } catch (_) {
+    return [];
+  }
 }
 
 function defaultScheduleStartValue() {
@@ -1544,6 +1575,7 @@ export default function App() {
     const processControl = resolveField("process");
     const machineControl = resolveField("machine");
     const startTimeControl = resolveField("scheduleStartTime");
+    const scheduleNoControl = resolveField("scheduleNo");
     const endTimeControl = resolveField("scheduleEndTime");
     const changedIdSet = new Set(changedIds);
     const changed = nextRows.filter((row) => changedIdSet.has(row.rowid) && !isVirtualRow(row));
@@ -1564,6 +1596,7 @@ export default function App() {
       if (Number(row.sequence) !== Number(previous.sequence)) controls.push({ ...sequenceControl, value: encodeValue(sequenceControl, row.sequence) });
       if (startTimeControl && row.scheduleStartTime !== previous.scheduleStartTime) controls.push({ ...startTimeControl, value: encodeValue(startTimeControl, row.scheduleStartTime) });
       if (endTimeControl && row.scheduleEndTime !== previous.scheduleEndTime) controls.push({ ...endTimeControl, value: encodeValue(endTimeControl, row.scheduleEndTime) });
+      if (scheduleNoControl && (row.scheduleNo || "") !== (previous.scheduleNo || "")) controls.push({ ...scheduleNoControl, value: encodeValue(scheduleNoControl, row.scheduleNo || "") });
       return controls.length ? {
         rowId: row.rowid,
         payload: {
@@ -1612,7 +1645,7 @@ export default function App() {
           });
           setRows((current) => current.map((row) => {
             const previous = restore.get(row.rowid);
-            return previous ? { ...row, status: previous.status, process: previous.process, machine: previous.machine, sequence: previous.sequence, __sig: "" } : row;
+            return previous ? { ...row, status: previous.status, process: previous.process, machine: previous.machine, sequence: previous.sequence, scheduleNo: previous.scheduleNo, __sig: "" } : row;
           }));
           setNotice(`保存失败，已恢复：${error.message || "请检查字段权限和映射"}`);
         });
@@ -1687,9 +1720,13 @@ export default function App() {
     } else {
       movedRows = movedRows.map((row) => ({ ...row, sequence: 0 }));
     }
+    // 排程单号只在确定排程时生成；拖回未排程时清空
+    const scheduleNoControl = resolveField("scheduleNo");
+    if (scheduleNoControl && lane === "queued") movedRows = movedRows.map((row) => ({ ...row, scheduleNo: "" }));
     const currentById = new Map(rows.map((row) => [row.rowid, row]));
     const optimistic = applyOptimistic(new Map(movedRows.map((row) => [row.rowid, {
-      status: row.status, process: row.process, machine: row.machine, sequence: row.sequence
+      status: row.status, process: row.process, machine: row.machine, sequence: row.sequence,
+      ...(scheduleNoControl ? { scheduleNo: row.scheduleNo } : {})
     }])));
     // 拖完后这些行取消勾选，其余勾选保持
     const movedIdSet = new Set(movedRows.map((row) => row.rowid));
@@ -1886,7 +1923,22 @@ export default function App() {
       });
   };
 
-  // 确定排程：弹窗立即关闭，排程时间立即算好显示；后台先保存时间和顺序，再触发“确定排程”按钮。
+  // 机床卡片所在工序的名称（合并卡片取它所在的工序，如联动线 → 印刷）
+  const cardProcessName = (cardKey, row) => {
+    const group = processGroups.find((item) => item.machines.some((machine) => machine.key === cardKey));
+    return (group && group.name) || readableProcessName(row.process, row.machine);
+  };
+  const previewScheduleNo = () => {
+    const target = scheduled.find((row) => !isVirtualRow(row));
+    if (!target) return "";
+    const prefix = `${cardProcessName(machineCardKey(target), target)}${scheduleNoDate()}`;
+    const max = rows.reduce((value, row) => Math.max(value, scheduleNoSerial(row.scheduleNo, prefix)), 0);
+    return `${prefix}${String(max + 1).padStart(3, "0")}`;
+  };
+
+  // 确定排程：弹窗立即关闭，排程时间立即算好显示；后台依次
+  // ①保存时间和顺序 ②生成排程单号（工序+年月日+3位流水号，每张机床卡片一批共用一个）并写入整批记录
+  // ③排程单号全部写入成功后才触发“确定排程”工作流（任一步失败都不触发）。
   const confirmSchedule = (startTimeValue) => {
     if (confirmingSchedule || !scheduled.length) return;
     if (!startTimeValue) {
@@ -1899,34 +1951,89 @@ export default function App() {
       setNotice("当前没有可确定排程的真实记录");
       return;
     }
+    const scheduleNoControl = resolveField("scheduleNo");
+    if (!scheduleNoControl) {
+      setNotice("未找到“排程单号”字段：请先在明道云表中添加文本字段“排程单号”，再确定排程");
+      return;
+    }
     const sortJob = autoSort("scheduled", startTimeValue, true);
     if (!sortJob) return;
+    // 每张机床卡片一批（合并卡片算一台设备），一批一个排程单号
+    const batches = new Map();
+    realTargets.forEach((row) => {
+      const key = machineCardKey(row);
+      if (!batches.has(key)) batches.set(key, { process: cardProcessName(key, row), rows: [], no: "" });
+      batches.get(key).rows.push(row);
+    });
     const rowIds = realTargets.map((row) => row.rowid);
     setConfirmStartTime("");
     setConfirmingSchedule(true);
     setSelectedRowIds([]);
-    setNotice(`正在确定排程 ${rowIds.length} 条（后台提交中，可继续操作）`);
+    setNotice(`正在确定排程 ${rowIds.length} 条：保存时间 → 生成排程单号 → 触发确定排程（后台进行，可继续操作）`);
+    let numberOptimistic = null;
+    let numbersSaved = false;
     sortJob
       .then((sorted) => {
-        if (!sorted) throw new Error("排程时间未能保存");
+        if (!sorted) throw new Error("排程时间未能保存，未生成排程单号，也未触发确定排程");
         return enqueueSync(async () => {
+          const dateText = scheduleNoDate();
+          const counters = new Map();
+          const patches = new Map();
+          for (const batch of batches.values()) {
+            const prefix = `${batch.process}${dateText}`;
+            if (!counters.has(prefix)) {
+              const existing = [
+                ...await fetchExistingScheduleNos(scheduleNoControl, prefix, { appId, worksheetId }),
+                ...rowsRef.current.map((row) => row.scheduleNo)
+              ];
+              counters.set(prefix, existing.reduce((max, value) => Math.max(max, scheduleNoSerial(value, prefix)), 0));
+            }
+            const serial = counters.get(prefix) + 1;
+            counters.set(prefix, serial);
+            batch.no = `${prefix}${String(serial).padStart(3, "0")}`;
+            batch.rows.forEach((row) => { if (row.scheduleNo !== batch.no) patches.set(row.rowid, { scheduleNo: batch.no }); });
+          }
+          if (patches.size) numberOptimistic = applyOptimistic(patches);
+          const writeNo = (rowId, value) => updateRow({
+            appId, worksheetId, viewId, rowId,
+            newOldControl: [{ controlId: scheduleNoControl.controlId, controlName: scheduleNoControl.controlName, type: scheduleNoControl.type, value: encodeValue(scheduleNoControl, value) }]
+          });
+          const written = [];
+          try {
+            await runConcurrently(Array.from(patches.entries()).map(([rowId, patch]) => async () => {
+              await writeNo(rowId, patch.scheduleNo);
+              written.push(rowId);
+            }));
+          } catch (error) {
+            // 部分记录已写入时改回原单号，保证同一批不会出现两个单号
+            const previousNo = new Map(realTargets.map((row) => [row.rowid, row.scheduleNo || ""]));
+            await runConcurrently(written.map((rowId) => () => writeNo(rowId, previousNo.get(rowId) || ""))).catch(() => undefined);
+            throw new Error(`排程单号写入失败，未触发确定排程（${error.message || "请检查排程单号字段权限"}）`);
+          }
+          numbersSaved = true;
+          if (numberOptimistic) numberOptimistic.saved();
+          const numbers = Array.from(batches.values()).map((batch) => batch.no).join("、");
           const button = await findWorksheetButton("确定排程", { appId, worksheetId, viewId, rowId: rowIds[0] });
           const btnId = button && button.btnId;
-          if (!btnId) throw new Error("当前视图未找到“确定排程”自定义按钮");
+          if (!btnId) throw new Error(`排程单号 ${numbers} 已写入，但当前视图未找到“确定排程”自定义按钮`);
           const payload = compact({
             appId: worksheetId, sources: rowIds, triggerId: btnId,
             pushUniqueId: getPushUniqueId(), viewId, isAll: false,
-            dataLog: `机床排程工作台确定当前页面已排程记录，共 ${rowIds.length} 条`
+            dataLog: `机床排程工作台确定排程，排程单号 ${numbers}，共 ${rowIds.length} 条`
           });
           window.__machineSchedulerLastConfirmAction = { button, payload };
           await startProcess(payload);
+          return numbers;
         });
       })
-      .then(() => {
-        setNotice(`已对当前页面显示的 ${rowIds.length} 条已排程记录触发确定排程`);
+      .then((numbers) => {
+        setNotice(`已确定排程：${rowIds.length} 条，排程单号 ${numbers}`);
         scheduleRefresh(1000);
       })
-      .catch((error) => setNotice(`确定排程失败：${error.message || "请检查自定义按钮配置"}`))
+      .catch((error) => {
+        if (!numbersSaved && numberOptimistic) numberOptimistic.rollback();
+        setNotice(`确定排程失败：${error.message || "请检查自定义按钮配置"}`);
+      })
       .finally(() => setConfirmingSchedule(false));
   };
 
@@ -2170,7 +2277,15 @@ export default function App() {
 
       {splitTarget && <div className="modal-backdrop" onMouseDown={() => setSplitTarget(null)}><div className="split-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title">调整并分拆排程量</div><p className="modal-record">{cardData(splitTarget).title}</p><label>原排程量<strong>{splitTarget.scheduleQuantity || "—"}</strong></label><label>调整后保留量<input autoFocus type="number" min="0" max={splitTarget.scheduleQuantity} value={splitAmount} onChange={(event) => setSplitAmount(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirmSplit(); }} /></label><p className="split-hint">拆出数量：<strong>{Math.max(0, Number(splitTarget.scheduleQuantity || 0) - Number(splitAmount || 0))}</strong>，确认后调用当前视图的“分拆”按钮。</p><div className="modal-actions"><button className="secondary" onClick={() => setSplitTarget(null)}>{splitTarget.__requestedQuantity !== undefined ? "仅保留修改" : "取消"}</button><button className="primary" onClick={confirmSplit}>修改并分拆</button></div></div></div>}
 
-      {confirmStartTime && <div className="modal-backdrop" onMouseDown={() => !confirmingSchedule && setConfirmStartTime("")}><div className="split-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title">确定排程时间</div><p className="modal-record">将从指定时间开始，按每条任务的张/分钟和换版时间连续计算开始、结束时间。</p><label>排程开始时间<input autoFocus type="datetime-local" step="60" value={confirmStartTime} onChange={(event) => setConfirmStartTime(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirmSchedule(confirmStartTime); }} /></label><p className="split-hint">默认值为明天上午 08:00。每张机床卡片（合并卡片算一台设备）从该时间起连续计算：每条时长 = 排程量 ÷ 张/分钟 + 换版时间；缺少张/分钟的任务只计入换版时间。</p><div className="modal-actions"><button className="secondary" onClick={() => setConfirmStartTime("")} disabled={confirmingSchedule}>取消</button><button className="primary" onClick={() => confirmSchedule(confirmStartTime)} disabled={confirmingSchedule}>{confirmingSchedule ? "计算并提交中…" : "计算时间并确定排程"}</button></div></div></div>}
+      {confirmStartTime && <div className="modal-backdrop" onMouseDown={() => !confirmingSchedule && setConfirmStartTime("")}><div className="split-modal confirm-schedule-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-title">确定排程</div>
+        <p className="modal-record">右侧已排程 {scheduled.filter((row) => !isVirtualRow(row)).length} 条：生成排程单号并从指定时间起连续计算开始、结束时间。</p>
+        <label>排程单号<strong className="schedule-no-preview">{previewScheduleNo()}</strong></label>
+        <p className="schedule-no-hint">按“工序 + 年月日 + 3 位流水号”在确定时生成，以实际生成为准；已排程的整批（含之前未生产完的）统一使用这个单号。</p>
+        <label>排程开始时间<input autoFocus type="datetime-local" step="60" value={confirmStartTime} onChange={(event) => setConfirmStartTime(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirmSchedule(confirmStartTime); }} /></label>
+        <p className="split-hint">默认值为明天上午 08:00。每张机床卡片（合并卡片算一台设备）从该时间起连续计算：每条时长 = 排程量 ÷ 张/分钟 + 换版时间。<br />提交顺序：保存时间和顺序 → 生成并写入排程单号 → 全部写入成功后才触发“确定排程”工作流。</p>
+        <div className="modal-actions"><button className="secondary" onClick={() => setConfirmStartTime("")} disabled={confirmingSchedule}>取消</button><button className="primary" onClick={() => confirmSchedule(confirmStartTime)} disabled={confirmingSchedule}>{confirmingSchedule ? "计算并提交中…" : "确定排程"}</button></div>
+      </div></div>}
 
       {machineMergeTargetKey !== null && activeMachineInfo && activeMachineGroup && <div className="modal-backdrop" onMouseDown={() => setMachineMergeTargetKey(null)}><div className="split-modal machine-merge-modal" onMouseDown={(event) => event.stopPropagation()}><div className="modal-title">合并机床</div><p className="modal-record">仅合并同一工序内的机床任务，工序字段不会变更。</p><label>当前工序<strong>{activeMachineGroup.name}</strong></label><label>来源机床<strong>{activeMachineInfo.name}</strong></label><label>合并到<select value={machineMergeTargetKey} onChange={(event) => setMachineMergeTargetKey(event.target.value)}>{mergeTargetMachines.map((machine) => <option key={machine.key} value={machine.key}>{machine.name}</option>)}</select></label><p className="split-hint">确认后将把“{activeMachineInfo.name}”下的 {activeMachineInfo.count} 条任务批量转移到目标机床，任务所属工序保持为“{activeMachineGroup.name}”。</p><div className="modal-actions"><button className="secondary" onClick={() => setMachineMergeTargetKey(null)}>取消</button><button className="primary" onClick={confirmMachineMerge}>确认合并</button></div></div></div>}
 

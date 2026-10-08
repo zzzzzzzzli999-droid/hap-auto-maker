@@ -39,7 +39,8 @@
     { controlId: "c_die", controlName: "模切版", type: 2 },
     { controlId: "c_print", controlName: "印刷版", type: 2 },
     { controlId: "c_wa", controlName: "瓦量", type: 6 },
-    { controlId: "c_change", controlName: "换版", type: 6 }
+    { controlId: "c_change", controlName: "换版", type: 6 },
+    ...(params.get("nosno") === "1" ? [] : [{ controlId: "c_sno", controlName: "排程单号", type: 2 }])
   ];
   window.env = {
     process: "c_process", machine: "c_machine", machineSequence: "c_mseq", scheduleStatus: "c_status",
@@ -78,7 +79,7 @@
       const qty = 300 + (id * 37) % 900;
       store.set(rowid, {
         rowid, c_process: process, c_machine: machineValue(machine), c_mseq: String(mseq),
-        c_status: JSON.stringify([status]), c_seq: String(seq), c_qty: String(qty), c_pre: String(qty), c_ok: "0",
+        c_status: JSON.stringify([status]), c_seq: String(seq), c_sno: status === "k_scheduled" ? `${process}20261001001` : "", c_qty: String(qty), c_pre: String(qty), c_ok: "0",
         c_customer: CUSTOMERS[id % CUSTOMERS.length], c_order: `X2609${String(10000 + id)}`, c_code: `A${100 + id % 400}-${String(id).padStart(3, "0")}A`,
         c_name: ["320g大青盐加碘纸箱", "2.25kg餐饮原味", "160g番茄火锅", "周转箱", "300g精制湖盐"][id % 5], c_size: `${400 + (id * 7) % 60}*${300 + id % 3 * 10}*180`,
         c_req: String(qty), c_prod: String(qty), c_remark: "", c_start: "", c_end: "", c_rate: String(60 + id % 40),
@@ -108,6 +109,10 @@
     if (window.__mock.failNext > 0 && (action === "updateWorksheetRow" || action === "startProcess")) {
       window.__mock.failNext -= 1;
       return new Error("模拟网络错误");
+    }
+    if (action === "updateWorksheetRow" && window.__mock.failControl && data.newOldControl.some((c) => c.controlId === window.__mock.failControl)) {
+      window.__mock.failControl = "";
+      return new Error("模拟排程单号写入失败");
     }
     if (action === "updateWorksheetRow") {
       const row = store.get(data.rowId);

@@ -322,6 +322,34 @@
   ]
  },
  {
+  "controlName": "排程单号字段（确定排程时按 工序+年月日+3位流水号 生成）",
+  "type": 200,
+  "attribute": 0,
+  "row": 0,
+  "col": 0,
+  "dot": 0,
+  "enumDefault": 0,
+  "enumDefault2": 0,
+  "dataSource": "",
+  "sourceControlType": 0,
+  "noticeItem": 0,
+  "userPermission": 0,
+  "options": [],
+  "unique": false,
+  "required": false,
+  "desc": "",
+  "advancedSetting": {
+   "allowitem": "0"
+  },
+  "size": 0,
+  "disabled": false,
+  "checked": false,
+  "fieldId": "scheduleNo",
+  "controls": [
+   "2"
+  ]
+ },
+ {
   "controlName": "排程量字段",
   "type": 200,
   "attribute": 0,
