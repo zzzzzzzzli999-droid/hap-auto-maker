@@ -338,7 +338,7 @@ async function waitIdle(page, timeout = 20000) {
     let continuous = true; let durationsOk = true;
     actual.forEach((row, i) => {
       const minutes = (parse(row.c_end) - parse(row.c_start)) / 60000;
-      if (minutes !== Math.ceil(Number(row.c_qty) / Number(row.c_rate))) durationsOk = false;
+      if (minutes !== Math.ceil(Number(row.c_qty) / Number(row.c_rate)) + Number(row.c_change || 0)) durationsOk = false;
       if (i > 0 && row.c_start !== actual[i - 1].c_end) continuous = false;
     });
     const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
@@ -361,7 +361,7 @@ async function waitIdle(page, timeout = 20000) {
   check("同一机床的任务连在一起（每种机床只出现一段）", new Set(sortResult.machineRuns).size === sortResult.machineRuns.length, sortResult.machineRuns.join(" → "));
   check("第一条从次日 08:00 开始", sortResult.firstStart === sortResult.expectedStart, sortResult.firstStart);
   check("整张卡片一条连续时间线（不按机床重新从 8 点算）", sortResult.continuous, `结束于 ${sortResult.lastEnd}`);
-  check("每条时长 = 排程量 ÷ 张/分钟", sortResult.durationsOk);
+  check("每条时长 = 排程量 ÷ 张/分钟 + 换版（字段名“换版”自动识别）", sortResult.durationsOk);
   const plateRead = await page.evaluate(() => window.__mock.calls.some(() => true));
   check("页面无脚本错误（自动排序）", page.__errors.length === 0, page.__errors.join(" | "));
   await page.close();
