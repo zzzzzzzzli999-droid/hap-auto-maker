@@ -56,6 +56,42 @@ async function columnValues(page, board, label) {
   }, { board, label });
 }
 
+// 拖动列表行：像真人一样，在行“看得见的部分”按下，拖到目标“看得见的部分”松开。
+// 行比列表宽很多，Playwright 的 dragTo 默认按整行正中间（在栏外面），重试时还会自己滚动，所以这里手动拖；
+// 只在竖直方向把行滚到列表中间，不改横向滚动。目标是整个列表（.card-list）时，松开在列表看得见的区域里；
+// targetPosition 用于拖到某一行上（相对该行看得见部分的左边、行的顶部）。
+async function dragRow(source, target, { targetPosition } = {}) {
+  const page = source.page();
+  await source.evaluate((el) => {
+    const list = el.closest(".list-table");
+    if (!list) return;
+    const r = el.getBoundingClientRect();
+    const l = list.getBoundingClientRect();
+    list.scrollTop += (r.top + r.height / 2) - (l.top + l.height / 2);
+  });
+  await page.waitForTimeout(60);
+  const from = await source.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    const l = el.closest(".list-table").getBoundingClientRect();
+    return { x: Math.max(r.left, l.left) + 45, y: r.top + r.height / 2 };
+  });
+  const to = await target.evaluate((el, position) => {
+    const list = el.closest(".list-table") || el;
+    const l = list.getBoundingClientRect();
+    const head = list.querySelector(".list-head");
+    const top = l.top + (head ? head.getBoundingClientRect().height : 0);
+    if (el.classList.contains("card-list")) return { x: l.left + Math.min(l.width / 2, 220), y: (top + l.bottom) / 2 };
+    const r = el.getBoundingClientRect();
+    const left = Math.max(r.left, l.left);
+    return position ? { x: left + position.x, y: r.top + position.y } : { x: left + 45, y: r.top + r.height / 2 };
+  }, targetPosition || null);
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(to.x, to.y, { steps: 6 });
+  await page.mouse.move(to.x + 1, to.y + 1, { steps: 2 });
+  await page.mouse.up();
+}
+
 async function waitIdle(page, timeout = 20000) {
   await page.waitForFunction(() => window.__mock.inflight === 0 && !document.querySelector(".sync-badge"), null, { timeout });
   await page.waitForTimeout(1600);
@@ -146,7 +182,7 @@ async function waitIdle(page, timeout = 20000) {
     observer.observe(document.querySelector(".scheduled-board"), { subtree: true, childList: true });
     document.querySelector(".scheduled-board").addEventListener("drop", () => { window.__dropAt = performance.now(); }, true);
   });
-  await page.locator(".unscheduled-board .schedule-row").nth(target.index).dragTo(page.locator(".scheduled-board .card-list"));
+  await dragRow(page.locator(".unscheduled-board .schedule-row").nth(target.index), page.locator(".scheduled-board .card-list"));
   await page.waitForFunction(() => window.__shownAt > 0, null, { timeout: 5000 });
   const dropMs = await page.evaluate(() => window.__shownAt - window.__dropAt);
   check("拖拽后立即显示在右侧（< 100ms）", dropMs < 100, `${dropMs.toFixed(1)}ms`);
@@ -167,7 +203,7 @@ async function waitIdle(page, timeout = 20000) {
   await clickCard(page, "联动线");
   const firstBefore = await columnValues(page, "scheduled-board", "生产单号");
   const movingOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[0];
-  await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .schedule-row").first());
+  await dragRow(page.locator(".unscheduled-board .schedule-row").first(), page.locator(".scheduled-board .schedule-row").first(), { targetPosition: { x: 60, y: 8 } });
   await page.waitForTimeout(150);
   const firstAfter = await columnValues(page, "scheduled-board", "生产单号");
   check("拖到第一条上时插在第一条之前", firstAfter[0] === movingOrder && firstAfter[1] === firstBefore[0], `${firstAfter.slice(0, 2).join(" , ")}`);
@@ -440,7 +476,7 @@ async function waitIdle(page, timeout = 20000) {
 
   const pickedOrders = [ordersQ[1], ordersQ[3], ordersQ[5]];
   await page.evaluate(() => { window.__dropAt = 0; window.__shownAt = 0; const board = document.querySelector(".scheduled-board"); board.addEventListener("drop", () => { window.__dropAt = performance.now(); const poll = () => { if (board.querySelectorAll(".schedule-row").length >= 3) window.__shownAt = performance.now(); else requestAnimationFrame(poll); }; requestAnimationFrame(poll); }, { capture: true, once: true }); });
-  await queuedRows.nth(3).dragTo(page.locator(".scheduled-board .card-list"));
+  await dragRow(queuedRows.nth(3), page.locator(".scheduled-board .card-list"));
   await page.waitForFunction(() => window.__shownAt > 0, null, { timeout: 5000 });
   const multiDropMs = await page.evaluate(() => window.__shownAt - window.__dropAt);
   const scheduledOrders = await columnValues(page, "scheduled-board", "生产单号");
@@ -463,7 +499,7 @@ async function waitIdle(page, timeout = 20000) {
   check("菜单全不选后取消全部勾选", !(await chip("scheduled-board")));
   await page.click(".scheduled-board .select-header input");
   check("点表头勾选框也能全选", (await chip("scheduled-board")) === "已勾选 3");
-  await page.locator(".scheduled-board .schedule-row").first().dragTo(page.locator(".unscheduled-board .card-list"));
+  await dragRow(page.locator(".scheduled-board .schedule-row").first(), page.locator(".unscheduled-board .card-list"));
   await page.waitForTimeout(120);
   const backLeft = await columnValues(page, "unscheduled-board", "生产单号");
   check("勾选的已排程行一起拖回未排程", (await page.$$(".scheduled-board .schedule-row")).length === 0 && pickedOrders.every((o) => backLeft.includes(o)), `右侧剩 ${(await page.$$(".scheduled-board .schedule-row")).length} 条`);
@@ -474,7 +510,7 @@ async function waitIdle(page, timeout = 20000) {
   await rowsNow.nth(0).locator(".check-cell input").check();
   await rowsNow.nth(2).locator(".check-cell input").check();
   const loneOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[4];
-  await rowsNow.nth(4).dragTo(page.locator(".scheduled-board .card-list"));
+  await dragRow(rowsNow.nth(4), page.locator(".scheduled-board .card-list"));
   await page.waitForTimeout(120);
   const rightNow = await columnValues(page, "scheduled-board", "生产单号");
   check("拖动未勾选的行时只拖这一行，其他勾选保留", JSON.stringify(rightNow) === JSON.stringify([loneOrder]) && (await chip("unscheduled-board")) === "已勾选 2", `右侧：${rightNow.join(",")}；${await chip("unscheduled-board")}`);
@@ -545,7 +581,7 @@ async function waitIdle(page, timeout = 20000) {
   page = await open(browser);
   const groups9 = await cardsOf(page);
   const pengGroup = groups9.find((group) => group.process === "碰线");
-  check("碰线和新碰线+喷码合成一张“碰线”卡片（5+2=7）", pengGroup && pengGroup.cards.length === 1 && pengGroup.cards[0].name === "碰线" && pengGroup.cards[0].queued === 7 && pengGroup.cards[0].family, pengGroup && pengGroup.cards.map((c) => `${c.name}(${c.queued})`).join(" "));
+  check("碰线、新碰线+喷码、碰线B合成一张“碰线”卡片（5+2+3=10）", pengGroup && pengGroup.cards.length === 1 && pengGroup.cards[0].name === "碰线" && pengGroup.cards[0].queued === 10 && pengGroup.cards[0].family, pengGroup && pengGroup.cards.map((c) => `${c.name}(${c.queued})`).join(" "));
   const notice = () => page.$eval(".notice", (el) => el.textContent).catch(() => "");
   const storeBy = (orders) => page.evaluate((list) => list.map((o) => { const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o); return { machine: r.c_machine, process: r.c_process, status: r.c_status }; }), orders);
   const cardCount = async (name) => (await cardsOf(page)).flatMap((g) => g.cards).find((c) => c.name === name);
@@ -665,14 +701,14 @@ async function waitIdle(page, timeout = 20000) {
   const dwOrders = (await columnValues(page, "unscheduled-board", "生产单号")).slice(0, 2);
   await page.locator(".unscheduled-board .schedule-row").nth(0).locator(".check-cell input").check();
   await page.locator(".unscheduled-board .schedule-row").nth(1).locator(".check-cell input").check();
-  await page.locator(".unscheduled-board .schedule-row").nth(0).dragTo(page.locator(".scheduled-board .card-list"));
+  await dragRow(page.locator(".unscheduled-board .schedule-row").nth(0), page.locator(".scheduled-board .card-list"));
   await waitIdle(page);
   check("拖入已排程时不生成排程单号", (await snoOf(dwOrders)).every((v) => v === "") && (await columnValues(page, "scheduled-board", "排程单号")).every((v) => v === "—"), JSON.stringify(await snoOf(dwOrders)));
   // 平模机：已排程里有之前的单号（模切20261001001），拖回一条到未排程 → 清空
   await clickCard(page, "平模机");
   const oldOrder = (await columnValues(page, "scheduled-board", "生产单号"))[0];
   check("之前已排程的记录带有旧单号", (await snoOf([oldOrder]))[0] === "模切20261001001");
-  await page.locator(".scheduled-board .schedule-row").first().dragTo(page.locator(".unscheduled-board .card-list"));
+  await dragRow(page.locator(".scheduled-board .schedule-row").first(), page.locator(".unscheduled-board .card-list"));
   await page.waitForTimeout(100);
   const clearedUi = (await columnValues(page, "unscheduled-board", "排程单号"))[(await columnValues(page, "unscheduled-board", "生产单号")).indexOf(oldOrder)];
   await waitIdle(page);
@@ -680,7 +716,7 @@ async function waitIdle(page, timeout = 20000) {
   await clickCard(page, "联动线");
   // 再拖一条新任务进来，然后确定排程：旧的 + 新的 统一成一个新单号（工序+年月日+3位流水号）
   const newOrder = (await columnValues(page, "unscheduled-board", "生产单号"))[1];
-  await page.locator(".unscheduled-board .schedule-row").nth(1).dragTo(page.locator(".scheduled-board .card-list"));
+  await dragRow(page.locator(".unscheduled-board .schedule-row").nth(1), page.locator(".scheduled-board .card-list"));
   await waitIdle(page);
   await page.evaluate(() => { window.__mock.store.get("r0001").c_sno = "印刷" + (() => { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`; })() + "007"; });
   const batchOrders = await columnValues(page, "scheduled-board", "生产单号");
@@ -853,7 +889,7 @@ async function waitIdle(page, timeout = 20000) {
     await step("12e 拖动被拒绝", async () => {
       const dragOrder12 = (await laneOrders("unscheduled-board"))[0];
       await page.evaluate(() => { window.__mock.rejectNext = [{ resultCode: 72 }]; });
-      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await dragRow(page.locator(".unscheduled-board .schedule-row").first(), page.locator(".scheduled-board .card-list"));
       await waitIdle(page);
       const dragNotice12 = await notice12();
       check("拖动被明道拒绝：恢复到未排程，提示原因和生产单号", (await laneOrders("unscheduled-board")).includes(dragOrder12) && !(await laneOrders("scheduled-board")).includes(dragOrder12) && /已恢复/.test(dragNotice12) && /记录已锁定/.test(dragNotice12) && dragNotice12.includes(dragOrder12) && (await store12(dragOrder12)).status.includes("k_queued"), dragNotice12);
@@ -886,7 +922,7 @@ async function waitIdle(page, timeout = 20000) {
 
     // 12h 确定排程：工作流没有启动 → 明确提示单号已写入但工作流没执行
     await step("12h 确定排程工作流未启动", async () => {
-      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await dragRow(page.locator(".unscheduled-board .schedule-row").first(), page.locator(".scheduled-board .card-list"));
       await waitIdle(page);
       await page.click(".scheduled-board .confirm-schedule");
       await page.waitForSelector(".confirm-schedule-modal");
@@ -900,7 +936,7 @@ async function waitIdle(page, timeout = 20000) {
     await step("12i 返回成功但未改", async () => {
       const silentOrder = (await laneOrders("unscheduled-board"))[0];
       await page.evaluate(() => { window.__mock.ignoreNext = 1; });
-      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await dragRow(page.locator(".unscheduled-board .schedule-row").first(), page.locator(".scheduled-board .card-list"));
       await page.waitForFunction(() => /明道未保存，已恢复为明道中的数据/.test((document.querySelector(".notice") || {}).textContent || ""), null, { timeout: 30000 }).catch(() => undefined);
       const silentNotice = await notice12();
       check("返回成功但实际没改：约 15 秒后恢复为明道数据，提示列出生产单号", /明道未保存，已恢复为明道中的数据/.test(silentNotice) && silentNotice.includes(silentOrder) && (await laneOrders("unscheduled-board")).includes(silentOrder), silentNotice);
@@ -941,7 +977,7 @@ async function waitIdle(page, timeout = 20000) {
     });
     await step13("13c 没有排程单号不能打印", async () => {
       await clickCard(page, "大五色印刷");
-      await page.locator(".unscheduled-board .schedule-row").first().dragTo(page.locator(".scheduled-board .card-list"));
+      await dragRow(page.locator(".unscheduled-board .schedule-row").first(), page.locator(".scheduled-board .card-list"));
       await waitIdle(page);
       const btn = await page.$eval(".scheduled-board .print-schedule-trigger", (el) => ({ disabled: el.disabled, title: el.title }));
       check("这批还没有排程单号时“打印排程表”不可点，提示先确定排程", btn.disabled && /确定排程/.test(btn.title), JSON.stringify(btn));
@@ -1097,6 +1133,119 @@ async function waitIdle(page, timeout = 20000) {
     check("页面无脚本错误（分拆新建/补建/撤销）", page.__errors.length === 0, page.__errors.join(" | "));
     await page.screenshot({ path: path.join(__dirname, "shot-split.png") });
   }
+  await page.close();
+
+  // ---------- 16. 碰线卡片：碰线、碰线+喷码共用一个排程单号，碰线B单独一个；打印按勾选的记录打开对应汇总表 ----------
+  page = await open(browser, "latency=300");
+  try {
+    const today16 = await page.evaluate(() => { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`; });
+    const notice16 = () => page.$eval(".notice", (el) => el.textContent).catch(() => "");
+    await clickCard(page, "碰线");
+    await page.click(".unscheduled-board .select-menu-trigger");
+    await page.click(".unscheduled-board .select-menu button:text-is('全选')");
+    await dragRow(page.locator(".unscheduled-board .schedule-row").first(), page.locator(".scheduled-board .card-list"));
+    await waitIdle(page);
+    const orders16 = await columnValues(page, "scheduled-board", "生产单号");
+    check("碰线卡片 10 条任务（碰线 5、新碰线+喷码 2、碰线B 3）都拖进已排程", orders16.length === 10, orders16.length + " 条");
+    const callsBefore16 = await page.evaluate(() => window.__mock.calls.length);
+    await page.click(".scheduled-board .confirm-schedule");
+    await page.waitForSelector(".confirm-schedule-modal");
+    const preview16 = await page.textContent(".confirm-schedule-modal .schedule-no-preview");
+    const previewNos = preview16.match(new RegExp(`碰线${today16}\\d{3}`, "g")) || [];
+    check("确定排程弹窗预览两个排程单号，并注明碰线B单独一个", previewNos.length === 2 && previewNos[0] !== previewNos[1] && /碰线B/.test(preview16), preview16);
+    await page.click(".confirm-schedule-modal .primary");
+    await waitIdle(page);
+    const info16 = await page.evaluate((list) => list.map((o) => { const r = Array.from(window.__mock.store.values()).find((x) => x.c_order === o); return { order: o, machine: r.c_machine, sno: r.c_sno }; }), orders16);
+    const groupA = new Set(info16.filter((i) => i.machine !== "碰线B").map((i) => i.sno));
+    const groupB = new Set(info16.filter((i) => i.machine === "碰线B").map((i) => i.sno));
+    const noA = [...groupA][0];
+    const noB = [...groupB][0];
+    const fmt = new RegExp(`^碰线${today16}\\d{3}$`);
+    check("碰线、新碰线+喷码共用一个排程单号；碰线B单独一个（都是 碰线 + 今天日期 + 3 位流水号）", groupA.size === 1 && groupB.size === 1 && noA !== noB && fmt.test(noA) && fmt.test(noB), `碰线/碰线+喷码：${[...groupA].join(",")}；碰线B：${[...groupB].join(",")}`);
+    const flow16 = await page.evaluate((n) => window.__mock.calls.slice(n).map((c) => ({ sno: (c.data.newOldControl || []).some((x) => x.controlId === "c_sno"), wf: c.data.triggerId === "b_confirm" })), callsBefore16);
+    check("两个排程单号都写完后才触发一次“确定排程”工作流", flow16.filter((c) => c.wf).length === 1 && flow16.findIndex((c) => c.wf) > flow16.map((c) => c.sno).lastIndexOf(true), JSON.stringify(flow16.filter((c) => c.sno || c.wf).length));
+    // 打印：不勾选时卡片里有两个单号 → 提示先勾选；勾碰线B的任务 → 碰线B的汇总表；勾碰线的任务 → 另一张
+    const before16 = await page.evaluate(() => window.__mock.opened.length);
+    await page.click(".scheduled-board .print-schedule-trigger");
+    await page.waitForTimeout(300);
+    const askNotice = await notice16();
+    check("卡片里有两个排程单号又没勾选时，提示先勾选要打印的那一批", (await page.evaluate(() => window.__mock.opened.length)) === before16 && /2 个排程单号/.test(askNotice) && /勾选/.test(askNotice), askNotice);
+    const machines16 = await columnValues(page, "scheduled-board", "机床");
+    const rowsLoc = page.locator(".scheduled-board .schedule-row");
+    await rowsLoc.nth(machines16.indexOf("碰线B")).locator(".check-cell input").check();
+    await page.click(".scheduled-board .print-schedule-trigger");
+    await page.waitForTimeout(400);
+    const openedB = await page.evaluate(() => window.__mock.opened.slice().pop());
+    check("勾选碰线B的任意一条任务，打印排程表打开碰线B那个单号的汇总表", openedB && openedB.recordId === await page.evaluate((no) => window.__mock.summarySid(no), noB), `${noB} ${JSON.stringify(openedB)}`);
+    await rowsLoc.nth(machines16.indexOf("碰线B")).locator(".check-cell input").uncheck();
+    await rowsLoc.nth(machines16.indexOf("新碰线+喷码")).locator(".check-cell input").check();
+    await page.click(".scheduled-board .print-schedule-trigger");
+    await page.waitForTimeout(400);
+    const openedA = await page.evaluate(() => window.__mock.opened.slice().pop());
+    check("勾选碰线+喷码（或碰线）的任务，打开碰线/碰线+喷码共用单号的汇总表", openedA && openedA.recordId === await page.evaluate((no) => window.__mock.summarySid(no), noA), `${noA} ${JSON.stringify(openedA)}`);
+    await rowsLoc.nth(machines16.indexOf("碰线B")).locator(".check-cell input").check();
+    await page.click(".scheduled-board .print-schedule-trigger");
+    await page.waitForTimeout(300);
+    check("同时勾了两个排程单号的任务时提示只勾一个单号的", /属于 2 个排程单号/.test(await notice16()), await notice16());
+    // 其他卡片不变：联动线仍是一张卡片一个单号（第 11 节已验证），这里确认大五色印刷一批只有一个单号
+    check("页面无脚本错误（碰线排程单号/打印）", page.__errors.length === 0, page.__errors.join(" | "));
+    await page.screenshot({ path: path.join(__dirname, "shot-peng.png") });
+  } catch (error) { check("16 碰线排程单号（步骤异常）", false, String(error.message).split("\n")[0]); }
+  await page.close();
+
+  // ---------- 17. 合计行：瓦量、排产量合计（列表底部，对齐对应列；列表长时固定在底部） ----------
+  page = await open(browser, "latency=300");
+  try {
+    const totalsOf = (board) => page.evaluate((b) => {
+      const root = document.querySelector(`.${b}`);
+      const total = root.querySelector(".lane-total");
+      if (!total) return null;
+      const headers = Array.from(root.querySelectorAll(".list-head > *"));
+      const headOf = (label) => headers.find((h) => h.textContent.replace(/[▼⋮]/g, "").trim() === label);
+      const rect = (el) => el ? el.getBoundingClientRect() : null;
+      const qty = total.querySelector(".total-scheduleQuantity");
+      const wa = total.querySelector(".total-corrugatedQuantity");
+      const hq = rect(headOf("排产量")), hw = rect(headOf("瓦量")), bq = rect(qty), bw = rect(wa), list = rect(root.querySelector(".list-table")), tb = rect(total);
+      const rows = Array.from(root.querySelectorAll(".schedule-row"));
+      const last = rows.length ? rect(rows[rows.length - 1]) : null;
+      return {
+        label: (Array.from(total.querySelectorAll(".total-label")).find((el) => el.textContent) || {}).textContent || "",
+        qty: qty && qty.textContent, wa: wa && wa.textContent,
+        qtyAligned: Boolean(hq && bq && Math.abs(hq.left - bq.left) < 12 && Math.abs(hq.right - bq.right) < 12),
+        waAligned: Boolean(hw && bw && Math.abs(hw.left - bw.left) < 12 && Math.abs(hw.right - bw.right) < 12),
+        inView: tb.top >= list.top && tb.bottom <= list.bottom + 1,
+        gapAfterLast: last ? Math.round(tb.top - last.bottom) : null
+      };
+    }, board);
+    const expected = () => page.evaluate(() => {
+      const rows = Array.from(window.__mock.store.values()).filter((r) => r.c_machine.includes("联动线"));
+      const sum = (list, key) => list.reduce((total, r) => total + Number(r[key] || 0), 0);
+      const queued = rows.filter((r) => r.c_status.includes("k_queued"));
+      const scheduled = rows.filter((r) => r.c_status.includes("k_scheduled"));
+      return { qn: queued.length, qq: sum(queued, "c_qty"), qw: sum(queued, "c_wa"), sn: scheduled.length, sq: sum(scheduled, "c_qty"), sw: sum(scheduled, "c_wa") };
+    });
+    let exp = await expected();
+    let q = await totalsOf("unscheduled-board");
+    let sch = await totalsOf("scheduled-board");
+    check("未排程合计：瓦量、排产量合计正确，“合计（N 条）”", q && q.label.startsWith(`合计（${exp.qn} 条）`) && q.qty === String(exp.qq) && q.wa === String(exp.qw), `${JSON.stringify(q)} / 应为 ${exp.qn} 条 ${exp.qq} ${exp.qw}`);
+    check("已排程合计：瓦量、排产量合计正确", sch && sch.label.startsWith(`合计（${exp.sn} 条）`) && sch.qty === String(exp.sq) && sch.wa === String(exp.sw), `${JSON.stringify(sch)} / 应为 ${exp.sn} 条 ${exp.sq} ${exp.sw}`);
+    check("合计数字落在“瓦量”“排产量”两列下面", q.qtyAligned && q.waAligned && sch.qtyAligned && sch.waAligned, JSON.stringify({ q: [q.qtyAligned, q.waAligned], s: [sch.qtyAligned, sch.waAligned] }));
+    check("列表很长（86 条）时合计行固定在列表底部可见；短列表时紧跟最后一行", q.inView && sch.inView && sch.gapAfterLast !== null && sch.gapAfterLast >= 0 && sch.gapAfterLast < 12, JSON.stringify({ queuedInView: q.inView, scheduledGap: sch.gapAfterLast }));
+    // 拖一条到已排程、改一个排程量：合计跟着变
+    await dragRow(page.locator(".unscheduled-board .schedule-row").first(), page.locator(".scheduled-board .card-list"));
+    await waitIdle(page);
+    const qtyInput = page.locator(".scheduled-board .schedule-row").first().locator(".quantity-cell input");
+    const oldQty = Number(await qtyInput.inputValue());
+    await qtyInput.fill(String(oldQty + 50));
+    await qtyInput.press("Enter");
+    await waitIdle(page);
+    exp = await expected();
+    q = await totalsOf("unscheduled-board");
+    sch = await totalsOf("scheduled-board");
+    check("拖动、改排产量后两栏合计立即更新", q.label.startsWith(`合计（${exp.qn} 条）`) && q.qty === String(exp.qq) && sch.label.startsWith(`合计（${exp.sn} 条）`) && sch.qty === String(exp.sq) && sch.wa === String(exp.sw), `${q.label} ${q.qty} / ${sch.label} ${sch.qty} ${sch.wa} / 应为 ${exp.qn}:${exp.qq} ${exp.sn}:${exp.sq}:${exp.sw}`);
+    check("页面无脚本错误（合计行）", page.__errors.length === 0, page.__errors.join(" | "));
+    await page.screenshot({ path: path.join(__dirname, "shot-totals.png") });
+  } catch (error) { check("17 合计行（步骤异常）", false, String(error.message).split("\n")[0]); }
   await page.close();
 
   const failed = results.filter((r) => !r.ok);

@@ -17,7 +17,7 @@ let fetchedControls = [];
 let fullControlsLoaded = false;
 const buttonCache = new Map();
 // 插件版本：显示在页面左下角，publish.sh 发布时也会打印。每次改代码都更新它，用来确认明道里跑的是哪个版本。
-const PLUGIN_VERSION = "2026.10.08-3";
+const PLUGIN_VERSION = "2026.10.09-1";
 
 const FIELD_ALIASES = {
   process: ["process", "工序"],
@@ -68,10 +68,12 @@ const DEFAULT_MACHINE = "联动线印刷+开槽";
 // 同一台设备在不同工序下有多个“机床”取值（如 大五色印刷 / 大五色印刷+圆模 / 大五色印刷+上油），
 // 顶部按设备合并成一张卡片（跨工序，放在 homeProcess 工序下，数量求和）；
 // 明细表显示“机床”列，拖拽/排序时每条任务仍写回它原本的工序和机床。
+// separateNumbers：同一张合并卡片里，确定排程时单独生成排程单号的机床（名称包含即算，忽略空格和大小写）。
+// 碰线卡片：碰线、碰线+喷码 共用一个排程单号，碰线B 单独一个排程单号；卡片、排序和排程时间计算都不变。
 const MACHINE_FAMILIES = [
   { match: "大五色", name: "大五色印刷", homeProcess: "印刷" },
   { match: "联动线", name: "联动线", homeProcess: "印刷" },
-  { match: "碰线", name: "碰线", homeProcess: "碰线" }
+  { match: "碰线", name: "碰线", homeProcess: "碰线", separateNumbers: ["碰线B"] }
 ];
 const FAMILY_KEY_PREFIX = "FAMILY::";
 const MACHINE_COLUMN = { key: "machine", label: "机床", width: 150, locked: true };
@@ -88,6 +90,18 @@ function isFamilyKey(key) {
 function machineCardKey(row) {
   const family = machineFamilyOf(row.machine);
   return family ? `${FAMILY_KEY_PREFIX}${family.name}` : `${row.process}::${row.machine}`;
+}
+
+function normalizeMachineName(name) {
+  return String(name || "").replace(/\s+/g, "").toUpperCase();
+}
+
+// 确定排程的分批：一张机床卡片一批、一批一个排程单号；合并卡片里 separateNumbers 列出的机床（如碰线B）单独一批
+function scheduleBatchKey(row) {
+  const key = machineCardKey(row);
+  const family = machineFamilyOf(row.machine);
+  const own = family && (family.separateNumbers || []).find((name) => normalizeMachineName(row.machine).includes(normalizeMachineName(name)));
+  return own ? `${key}::${own}` : key;
 }
 
 function isVirtualRow(row) {
@@ -1038,6 +1052,12 @@ const ScheduleCard = React.memo(function ScheduleCard({ row, index, selected, fl
 
 const CHECK_COLUMN_WIDTH = 34;
 
+// 合计行的数字：整数原样显示，小数最多两位
+function formatTotal(value) {
+  const rounded = Math.round((Number(value) || 0) * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
 // 栏标题按钮的线性图标（20×20，描边绘制）
 const BUTTON_ICONS = {
   swap: <path d="M3.5 7h12l-3.5-3.5M16.5 13h-12l3.5 3.5" />,
@@ -1082,7 +1102,7 @@ function SelectAllHeader({ total, selectedCount, onSelectAll, onClear }) {
 const VIRTUAL_ROW_HEIGHT = 34;
 const VIRTUAL_OVERSCAN = 12;
 
-function VirtualCardList({ rows, renderRow, empty, resetKey, focus }) {
+function VirtualCardList({ rows, renderRow, empty, resetKey, focus, footer }) {
   const listRef = useRef(null);
   const [viewport, setViewport] = useState({ scrollTop: 0, height: 700 });
   const rowsRef = useRef(rows);
@@ -1138,6 +1158,7 @@ function VirtualCardList({ rows, renderRow, empty, resetKey, focus }) {
     {startIndex > 0 && <div className="virtual-spacer" style={{ height: startIndex * VIRTUAL_ROW_HEIGHT }} />}
     {rows.slice(startIndex, endIndex).map((row, index) => renderRow(row, startIndex + index))}
     {endIndex < rows.length && <div className="virtual-spacer" style={{ height: (rows.length - endIndex) * VIRTUAL_ROW_HEIGHT }} />}
+    {rows.length > 0 && footer}
     {!rows.length && empty}
   </div>;
 }
@@ -2196,12 +2217,22 @@ export default function App() {
       setNotice("未找到“排程汇总表”字段：请在明道云表中添加关联“排程汇总”表的字段“排程汇总表”，或在插件设置中映射");
       return;
     }
-    // 只有确定排程、生成了排程单号的明细才能打印
-    const details = scheduled.filter((row) => !isVirtualRow(row) && row.scheduleNo);
-    if (!details.length) {
+    // 只有确定排程、生成了排程单号的明细才能打印；打开哪张汇总表由勾选的记录决定
+    // （碰线卡片里碰线B单独一个排程单号：勾碰线B的任务打开碰线B的汇总表，勾碰线/碰线+喷码的打开另一张）
+    const numbered = scheduled.filter((row) => !isVirtualRow(row) && row.scheduleNo);
+    if (!numbered.length) {
       setNotice("这批任务还没有排程单号：请先点“确定排程”生成排程单号和汇总表，再打印");
       return;
     }
+    const picked = numbered.filter((row) => selectedRowIdSet.has(row.rowid));
+    const numbers = Array.from(new Set((picked.length ? picked : numbered).map((row) => row.scheduleNo)));
+    if (numbers.length > 1) {
+      setNotice(picked.length
+        ? `勾选的任务属于 ${numbers.length} 个排程单号（${numbers.join("、")}），请只勾选要打印的那一个排程单号里的任务`
+        : `这张卡片有 ${numbers.length} 个排程单号（${numbers.join("、")}），请先勾选要打印的那一批里任意一条任务，再点“打印排程表”`);
+      return;
+    }
+    const details = (picked.length ? picked : numbered).filter((row) => row.scheduleNo === numbers[0]);
     if (!mdyeUtils || typeof mdyeUtils.openRecordInfo !== "function") {
       setNotice("当前环境不支持打开记录");
       return;
@@ -2227,7 +2258,7 @@ export default function App() {
         setNotice("已排程任务还没有排程汇总表：请先点“确定排程”，生成排程单号和汇总表后再打印");
         return;
       }
-      setNotice(`正在打开排程汇总表${target.name ? ` ${target.name}` : ""}，可在记录右上角“打印”`);
+      setNotice(`正在打开排程汇总表 ${target.name || numbers[0]}（${details.length} 条任务），可在记录右上角“打印”`);
       // 和在明细记录里点“排程汇总表”一样：用关联字段配置的应用和视图打开（视图里的打印模板、按钮才会出现）
       Promise.resolve(mdyeUtils.openRecordInfo(compact({ appId: control.appId || appId, worksheetId: control.dataSource, viewId: control.viewId, recordId: target.sid })))
         .catch((error) => setNotice(`打开排程汇总表失败：${toError(error).message}`));
@@ -2480,12 +2511,28 @@ export default function App() {
     const group = processGroups.find((item) => item.machines.some((machine) => machine.key === cardKey));
     return (group && group.name) || readableProcessName(row.process, row.machine);
   };
+  // 确定排程弹窗里预览本次要生成的排程单号：一批一个（碰线卡片里碰线B单独一批时显示两个，并注明各批机床）
+  const scheduleBatchesOf = (list) => {
+    const batches = new Map();
+    list.forEach((row) => {
+      const key = scheduleBatchKey(row);
+      if (!batches.has(key)) batches.set(key, { process: cardProcessName(machineCardKey(row), row), rows: [], machines: [], no: "" });
+      const batch = batches.get(key);
+      batch.rows.push(row);
+      if (!batch.machines.includes(row.machine)) batch.machines.push(row.machine);
+    });
+    return Array.from(batches.values());
+  };
   const previewScheduleNo = () => {
-    const target = scheduled.find((row) => !isVirtualRow(row));
-    if (!target) return "";
-    const prefix = `${cardProcessName(machineCardKey(target), target)}${scheduleNoDate()}`;
-    const max = rows.reduce((value, row) => Math.max(value, scheduleNoSerial(row.scheduleNo, prefix)), 0);
-    return `${prefix}${String(max + 1).padStart(3, "0")}`;
+    const batches = scheduleBatchesOf(scheduled.filter((row) => !isVirtualRow(row)));
+    const counters = new Map();
+    const numbers = batches.map((batch) => {
+      const prefix = `${batch.process}${scheduleNoDate()}`;
+      if (!counters.has(prefix)) counters.set(prefix, rows.reduce((value, row) => Math.max(value, scheduleNoSerial(row.scheduleNo, prefix)), 0));
+      counters.set(prefix, counters.get(prefix) + 1);
+      return `${prefix}${String(counters.get(prefix)).padStart(3, "0")}`;
+    });
+    return batches.length > 1 ? batches.map((batch, index) => `${numbers[index]}（${batch.machines.join("、")}）`).join("；") : numbers[0] || "";
   };
 
   // 确定排程：弹窗立即关闭，排程时间立即算好显示；后台依次
@@ -2510,13 +2557,8 @@ export default function App() {
     }
     const sortJob = autoSort("scheduled", startTimeValue, true);
     if (!sortJob) return;
-    // 每张机床卡片一批（合并卡片算一台设备），一批一个排程单号
-    const batches = new Map();
-    realTargets.forEach((row) => {
-      const key = machineCardKey(row);
-      if (!batches.has(key)) batches.set(key, { process: cardProcessName(key, row), rows: [], no: "" });
-      batches.get(key).rows.push(row);
-    });
+    // 每张机床卡片一批（合并卡片算一台设备），一批一个排程单号；碰线卡片里碰线B单独一批（见 MACHINE_FAMILIES.separateNumbers）
+    const batches = new Map(scheduleBatchesOf(realTargets).map((batch, index) => [index, batch]));
     const rowIds = realTargets.map((row) => row.rowid);
     setConfirmStartTime("");
     setConfirmingSchedule(true);
@@ -2824,6 +2866,25 @@ export default function App() {
     document.addEventListener("pointerup", onUp);
   };
 
+  // 合计行：当前列表（按列筛选后显示的记录）的瓦量、排产量合计，列宽与明细行相同，数字落在对应列下面；
+  // 列表很长时固定在列表底部（sticky），短列表时紧跟最后一行。被隐藏的合计列写在“合计”文字后面。
+  const TOTAL_KEYS = ["corrugatedQuantity", "scheduleQuantity"];
+  const laneTotalRow = (laneRows, isScheduled) => {
+    const totals = Object.fromEntries(TOTAL_KEYS.map((key) => [key, laneRows.reduce((sum, row) => sum + (Number(String(row[key] ?? "").replace(/,/g, "")) || 0), 0)]));
+    const shown = new Set(orderedColumns.filter((column) => column.width > 0).map((column) => column.key));
+    const hiddenText = TOTAL_KEYS.filter((key) => !shown.has(key))
+      .map((key) => ` · ${(DEFAULT_COLUMNS.find((column) => column.key === key) || {}).label || key} ${formatTotal(totals[key])}`).join("");
+    const labelIndex = orderedColumns.findIndex((column) => !TOTAL_KEYS.includes(column.key));
+    return <div className={`lane-total ${isScheduled ? "scheduled" : ""}`} style={isScheduled ? tableStyle : queuedTableStyle} aria-label="合计">
+      <span />
+      {isScheduled && <span />}
+      {orderedColumns.map((column, index) => TOTAL_KEYS.includes(column.key)
+        ? <span key={column.key} className={`total-value total-${column.key}`} title={`${column.label}合计`}>{formatTotal(totals[column.key])}</span>
+        : <span key={column.key} className="total-label">{index === labelIndex ? `合计（${laneRows.length} 条）${hiddenText}` : ""}</span>)}
+      <span className="total-action" />
+    </div>;
+  };
+
   // 行操作经稳定 ref 分发；弹窗/按钮状态变化时无需重绘数百条记录。
   rowActionsRef.current = {
     select: queueRowSelect,
@@ -2867,17 +2928,17 @@ export default function App() {
           <div className="board-head"><div>{maximizeButton("queued", "未排程")}<span className="dot amber" /><h2>未排程</h2><em>{unscheduled.length}</em>{selectedVisibleCount(unscheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(unscheduled)}</em>}{changeMachineButton("queued", unscheduled)}{activeMachineInfo && mergeTargetMachines.length > 0 && <button type="button" className="merge-machine-trigger head-btn ghost merge" onClick={openMachineMerge}><ButtonIcon name="merge" />合并机床</button>}</div><div className="board-tools"><p>将任务拖至右侧开始排程</p><button type="button" className="select-visible head-btn ghost" onClick={() => toggleSelectVisible(unscheduled)} disabled={!unscheduled.length}><ButtonIcon name="checkAll" />{unscheduled.length && selectedVisibleCount(unscheduled) === unscheduled.length ? "取消全选" : "全选"}</button><button type="button" className="head-btn primary" onClick={() => autoSort("queued")} disabled={!unscheduled.length}><ButtonIcon name="sort" />自动排序</button></div></div>
           <div className="list-table">
             <div className="list-head" style={queuedTableStyle}><SelectAllHeader key="check" total={unscheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(unscheduled)} onSelectAll={() => setLaneChecked(unscheduled, true)} onClear={() => setLaneChecked(unscheduled, false)} />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={queuedFilters[fieldKeys[index]]} options={() => queuedColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("queued", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
-            <VirtualCardList rows={unscheduled} resetKey={activeMachineKey} focus={flash} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty"><strong>没有未排程任务</strong><span>当前机床暂无可排程订单</span></div>} />
+            <VirtualCardList rows={unscheduled} resetKey={activeMachineKey} focus={flash} footer={laneTotalRow(unscheduled, false)} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty"><strong>没有未排程任务</strong><span>当前机床暂无可排程订单</span></div>} />
           </div>
         </div>
 
         <div className="board-splitter" onPointerDown={beginResize} onDoubleClick={togglePanes} title={hiddenPane ? "双击还原左右两栏" : "拖动调整左右区域宽度；双击隐藏/还原左右区域"}><span /></div>
 
         <div className={`board scheduled-board ${dragged ? "drop-ready" : ""}`} onDragOver={(e) => e.preventDefault()} onDrop={(e) => dropToLane("scheduled", e)}>
-          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}{changeMachineButton("scheduled", scheduled)}<button type="button" className="print-schedule-trigger head-btn ghost" onClick={openScheduleSummary} disabled={openingSummary || !printableCount} title={printableCount ? "打开这批排程单号的排程汇总表，在汇总表里打印" : "点“确定排程”生成排程单号后才能打印"}><ButtonIcon name="print" />{openingSummary ? "打开中…" : "打印排程表"}</button></div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button type="button" className="select-visible head-btn ghost" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}><ButtonIcon name="checkAll" />{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button type="button" className="head-btn primary" onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><ButtonIcon name="sort" />自动排序</button><button type="button" className="confirm-schedule head-btn success" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><ButtonIcon name="check" />{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
+          <div className="board-head"><div>{maximizeButton("scheduled", "已排程")}<span className="dot green" /><h2>已排程</h2><em>{scheduled.length}</em>{selectedVisibleCount(scheduled) > 0 && <em className="selected-count">已勾选 {selectedVisibleCount(scheduled)}</em>}{changeMachineButton("scheduled", scheduled)}<button type="button" className="print-schedule-trigger head-btn ghost" onClick={openScheduleSummary} disabled={openingSummary || !printableCount} title={printableCount ? "打开勾选任务所在排程单号的排程汇总表（卡片里只有一个排程单号时不用勾选），在汇总表里打印" : "点“确定排程”生成排程单号后才能打印"}><ButtonIcon name="print" />{openingSummary ? "打开中…" : "打印排程表"}</button></div><div className="board-tools"><p>拖动任务可自由调整优先级</p><button type="button" className="select-visible head-btn ghost" onClick={() => toggleSelectVisible(scheduled)} disabled={!scheduled.length}><ButtonIcon name="checkAll" />{scheduled.length && selectedVisibleCount(scheduled) === scheduled.length ? "取消全选" : "全选"}</button><button type="button" className="head-btn primary" onClick={() => autoSort("scheduled")} disabled={confirmingSchedule || !scheduled.length}><ButtonIcon name="sort" />自动排序</button><button type="button" className="confirm-schedule head-btn success" onClick={() => confirmSchedule()} disabled={confirmingSchedule || !scheduled.length}><ButtonIcon name="check" />{confirmingSchedule ? "提交中…" : "确定排程"}</button></div></div>
           <div className="list-table">
             <div className="list-head" style={tableStyle}><SelectAllHeader key="check" total={scheduled.filter((row) => !row.__pending).length} selectedCount={selectedVisibleCount(scheduled)} onSelectAll={() => setLaneChecked(scheduled, true)} onClear={() => setLaneChecked(scheduled, false)} /><FilterHeader key="sequence" columnKey="__sequence" label="序号" value={scheduledFilters.sequence} options={() => scheduledColumnOptions("sequence")} onChange={(value) => setColumnFilter("scheduled", "sequence", value)} layoutLocked />{displayHeaders.map((name, index) => <FilterHeader key={orderedColumns[index].key} columnKey={orderedColumns[index].key} label={name} value={scheduledFilters[fieldKeys[index]]} options={() => scheduledColumnOptions(fieldKeys[index])} onChange={(value) => setColumnFilter("scheduled", fieldKeys[index], value)} onColumnDragStart={setDraggedColumn} onColumnDragEnd={() => setDraggedColumn(null)} onColumnDrop={moveColumn} onResize={beginColumnResize} layoutLocked={Boolean(orderedColumns[index].locked)} />)}<span className="actions-header" key="actions">操作</span></div>
-            <VirtualCardList rows={scheduled} resetKey={activeMachineKey} focus={flash} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} scheduled selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty drop-empty"><strong>拖到这里开始排程</strong><span>任务会自动生成排程序号</span></div>} />
+            <VirtualCardList rows={scheduled} resetKey={activeMachineKey} focus={flash} footer={laneTotalRow(scheduled, true)} renderRow={(row, index) => <ScheduleCard key={row.rowid} row={row} index={index} {...cardData(row)} scheduled selected={selectedRowIdSet.has(row.rowid)} flashed={Boolean(flash && flash.rowIds.has(row.rowid))} actionsRef={rowActionsRef} />} empty={!loading && <div className="empty drop-empty"><strong>拖到这里开始排程</strong><span>任务会自动生成排程序号</span></div>} />
           </div>
         </div>
       </section>
@@ -2888,7 +2949,7 @@ export default function App() {
         <div className="modal-title">确定排程</div>
         <p className="modal-record">右侧已排程 {scheduled.filter((row) => !isVirtualRow(row)).length} 条：生成排程单号并从指定时间起连续计算开始、结束时间。</p>
         <label>排程单号<strong className="schedule-no-preview">{previewScheduleNo()}</strong></label>
-        <p className="schedule-no-hint">按“工序 + 年月日 + 3 位流水号”在确定时生成，以实际生成为准；已排程的整批（含之前未生产完的）统一使用这个单号。</p>
+        <p className="schedule-no-hint">按“工序 + 年月日 + 3 位流水号”在确定时生成，以实际生成为准；已排程的整批（含之前未生产完的）统一使用这个单号。碰线卡片里，碰线、碰线+喷码共用一个单号，碰线B单独一个单号。</p>
         <label>排程开始时间<input autoFocus type="datetime-local" step="60" value={confirmStartTime} onChange={(event) => setConfirmStartTime(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") confirmSchedule(confirmStartTime); }} /></label>
         <p className="split-hint">默认值为明天上午 08:00。每张机床卡片（合并卡片算一台设备）从该时间起连续计算：每条时长 = 排程量 ÷ 张/分钟 + 换版时间。<br />提交顺序：保存时间和顺序 → 生成并写入排程单号 → 全部写入成功后才触发“确定排程”工作流。</p>
         <div className="modal-actions"><button className="secondary" onClick={() => setConfirmStartTime("")} disabled={confirmingSchedule}>取消</button><button className="primary" onClick={() => confirmSchedule(confirmStartTime)} disabled={confirmingSchedule}>{confirmingSchedule ? "计算并提交中…" : "确定排程"}</button></div>

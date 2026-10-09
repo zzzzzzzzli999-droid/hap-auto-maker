@@ -164,6 +164,13 @@ button { color: inherit; }
 .filter-panel-footer { display: flex; align-items: center; justify-content: space-between; padding-top: 8px; color: #7791a3; font-size: 10px; }
 .filter-panel-footer button { height: 25px; padding: 0 11px; color: #fff; background: #287fc0; border: 1px solid #1f70aa; border-radius: 2px; cursor: pointer; font-size: 10px; }
 .card-list { min-height: 100%; padding: 0 4px 4px; }
+/* 合计行（瓦量、排产量）：和明细行同一套列宽；列表长时固定在底部 */
+.lane-total { position: sticky; bottom: 0; z-index: 12; width: 100%; min-width: var(--table-min-width, 486px); height: 34px; overflow: hidden; display: grid; align-items: center; margin-top: 4px; padding: 0 5px; color: #12466b; background: #e1eff8; border: 1px solid #93bdd7; border-radius: 3px; box-shadow: 0 -4px 10px rgba(40, 90, 125, .14); font-size: 13px; font-weight: 700; }
+.lane-total > * { min-width: 0; padding: 0 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane-total .total-label { color: #3f6782; font-size: 12px; }
+.lane-total .total-value { color: #0f5a8f; font-variant-numeric: tabular-nums; }
+.lane-total .total-scheduleQuantity { padding-right: 11px; text-align: right; font-size: 14px; }
+.lane-total .total-action { position: sticky; right: 0; align-self: stretch; background: #e1eff8; border-left: 1px solid #b9d4e3; }
 
 .schedule-row { --field-count: 3; height: 32px; min-height: 32px; margin-top: 2px; padding: 0 5px; color: #193f5b; background: #f8fcff; border: 1px solid #c3dbe8; border-radius: 2px; cursor: grab; font-size: 13px; transition: background .1s ease, border-color .1s ease; }
 @supports (content-visibility: auto) { .schedule-row { content-visibility: auto; contain-intrinsic-size: 32px; } }
