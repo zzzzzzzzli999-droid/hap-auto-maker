@@ -2,11 +2,17 @@
 # 一键更新并发布装车插件：
 #   ① 下载 GitHub 上指定版本的插件代码（默认分支最新版本）；
 #   ② 本地插件目录的 src/ 和 .config/ 先备份到 插件目录/.backup/时间/，再用新代码覆盖；
-#   ③ mdye sync-params 同步插件参数；④ mdye push 把新版本推送到明道。
+#   ③ mdye push 把新版本推送到明道。
 # 推送成功后，到明道「插件」→ 装车插件 → 提交记录 里点“发布”，刷新页面即用上新版本。
 #
+# 不执行 mdye sync-params：本插件的参数早已在明道里配好并映射到视图字段，
+# 本地 .config/params-config.json 不是明道的参数格式（"type": "field"），
+# sync-params 会报 “Error converting value "field" to type 'MD.Enum.Form.ControlType'”；
+# 改成明道格式再同步则会重建参数定义，可能清掉视图里已有的字段映射，影响现有业务。
+# 只有真的要增删插件参数时，才单独处理参数同步。
+#
 # 用法：bash publish.sh [版本(commit 或分支)] [插件目录]      不填插件目录时自动在 文稿/桌面/下载 里找
-# 注意：mdye sync-params / mdye push 失败时退出码也是 0，所以这里按输出文字判断是否成功。
+# 注意：mdye push 失败时退出码也是 0，所以这里按输出文字判断是否成功。
 
 COMMIT="${1:-claude/pensive-mendel-hhjymb}"
 REPO="zzzzzzzzli999-droid/hap-auto-maker"
@@ -74,8 +80,7 @@ run_mdye() {
   fi
 }
 
-run_mdye "③ 同步插件参数（mdye sync-params）…" "同步成功|synced successfully|同期に成功" sync-params
-run_mdye "④ 推送新版本到明道（mdye push）…" "push ?成功|push successful" push -m "$MESSAGE"
+run_mdye "③ 推送新版本到明道（mdye push）…" "push ?成功|push successful" push -m "$MESSAGE"
 
 echo ""
 echo "✓ 完成：本地插件已覆盖为 ${COMMIT}，新版本已推送到明道。"
