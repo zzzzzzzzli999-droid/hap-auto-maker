@@ -8263,6 +8263,7 @@ export default function App() {
       stateByRowId.set(serverRow.id, {
         checked: !!serverRow.checked,
         loadedQty: Number(serverRow.loadedQty) || 0,
+        loadingUser: serverRow.loadingUser || "",
       });
     });
     return stateByRowId;
@@ -8272,18 +8273,24 @@ export default function App() {
   // 装载工作流只认服务器上已勾选的明细。以前这里核对不上只提示、照常装载，随后又把
   // 没装上的行从列表里藏掉——这就是“勾上了记录，点装载却丢了”（视频里的
   // “注意：1 条明细未写入明道云…”）。现在核对不上就停下：勾选全部保留、整行标红。
+  // 取消勾选的写入同样可能被吞：屏幕上已取消、明道云里仍勾着的明细会被工作流装走，
+  // 也要拦下。
   // 返回：
-  //   { verifiedIds, unsavedRows, missingRows }
+  //   { verifiedIds, unsavedRows, missingRows, extraRows }
   //     verifiedIds  服务器已确认勾选的明细，工作流装走的就是这些
   //     unsavedRows  自动补写一次后，服务器上仍未勾上或装载量不一致
   //     missingRows  已不在本装车单的待装明细里（被别人装走、退回或删除）
+  //     extraRows    屏幕上未勾选、明道云里却是本账号可装的勾选状态
   //   null  无法核对（读不回明细或解析不到勾选字段），沿用原有行为
   async function verifyCheckedRowsPersisted() {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const expectedRows = getLatestDisplayRows().filter(
+      const latestRows = getLatestDisplayRows();
+      const expectedRows = latestRows.filter(
         (row) => !!row.checked && !isRowLoadedByAnotherAccount(row)
       );
-      if (!expectedRows.length) return { verifiedIds: [], unsavedRows: [], missingRows: [] };
+      if (!expectedRows.length) {
+        return { verifiedIds: [], unsavedRows: [], missingRows: [], extraRows: [] };
+      }
 
       let serverState = null;
       let readError = null;
@@ -8311,11 +8318,25 @@ export default function App() {
         if (!actual.checked) return true;
         return Math.abs(actual.loadedQty - (Number(row.loadedQty) || 0)) > 1e-6;
       });
-      if (!unsavedRows.length || attempt > 0) {
-        if (unsavedRows.length || missingRows.length) {
+      const extraRows = latestRows.filter((row) => {
+        const actual = serverState.get(row.id);
+        return (
+          !row.checked &&
+          !!actual?.checked &&
+          !isRowLoadedByAnotherAccount({ checked: true, loadingUser: actual.loadingUser })
+        );
+      });
+      // 只替操作员本次亲手取消过的行补写“取消”；别人在明道云里勾上的行不替他改，
+      // 交给操作员核对。
+      const rewritableExtraRows = extraRows.filter(
+        (row) => localDetailOverridesRef.current[row.id]?.checked === false
+      );
+      if ((!unsavedRows.length && !rewritableExtraRows.length) || attempt > 0) {
+        if (unsavedRows.length || missingRows.length || extraRows.length) {
           console.warn("detail rows not persisted before loading", {
             unsaved: unsavedRows.map((row) => row.id),
             missing: missingRows.map((row) => row.id),
+            extra: extraRows.map((row) => row.id),
           });
         }
         const problemIds = new Set([...unsavedRows, ...missingRows].map((row) => row.id));
@@ -8323,12 +8344,15 @@ export default function App() {
           verifiedIds: expectedRows.map((row) => row.id).filter((rowId) => !problemIds.has(rowId)),
           unsavedRows,
           missingRows,
+          extraRows,
         };
       }
 
-      setSaveStatus(`检测到 ${unsavedRows.length} 条明细未写入明道云，正在重写...`);
-      await Promise.allSettled(
-        unsavedRows.map((row) =>
+      setSaveStatus(
+        `检测到 ${unsavedRows.length + rewritableExtraRows.length} 条明细未写入明道云，正在重写...`
+      );
+      await Promise.allSettled([
+        ...unsavedRows.map((row) =>
           queueDetailSync(row.id, () =>
             syncDetailLoadedToMingdao(row, row.loadedQty, {
               syncChecked: true,
@@ -8336,11 +8360,29 @@ export default function App() {
               syncTop: false,
             })
           )
-        )
-      );
+        ),
+        ...rewritableExtraRows.map((row) =>
+          queueDetailSync(row.id, () =>
+            syncDetailLoadedToMingdao(row, "", {
+              syncChecked: true,
+              checked: false,
+              syncTop: false,
+            })
+          )
+        ),
+      ]);
       await waitForPendingDetailSyncs();
     }
     return null;
+  }
+
+  function hasUnverifiedLoadingRows(verification) {
+    return !!(
+      verification &&
+      (verification.unsavedRows.length ||
+        verification.missingRows.length ||
+        verification.extraRows.length)
+    );
   }
 
   function invalidatePageSwitchCache() {
@@ -8362,22 +8404,25 @@ export default function App() {
   }
 
   // 核对不通过时停在装载前：标红没保存上的行（勾选保留），移除已不在待装列表的行，
-  // 并用一句话告诉操作员哪几条、怎么处理。
-  function stopLoadingForUnverifiedRows({ unsavedRows, missingRows }) {
-    setUnsavedRowIds(new Set(unsavedRows.map((row) => row.id)));
-    if (missingRows.length) {
+  // 屏幕已取消但明道云仍勾着的行刷新成明道云里的状态，并告诉操作员哪几条、怎么处理。
+  function stopLoadingForUnverifiedRows({ unsavedRows, missingRows, extraRows }) {
+    setUnsavedRowIds(new Set([...unsavedRows, ...extraRows].map((row) => row.id)));
+    if (missingRows.length || extraRows.length) {
       const missingIds = new Set(missingRows.map((row) => row.id));
+      const resetIds = new Set([...missingRows, ...extraRows].map((row) => row.id));
       const nextOverrides = { ...localDetailOverridesRef.current };
-      missingIds.forEach((rowId) => {
+      resetIds.forEach((rowId) => {
         delete nextOverrides[rowId];
         detailSyncPromisesRef.current.delete(rowId);
         detailSyncErrorsRef.current.delete(rowId);
       });
       localDetailOverridesRef.current = nextOverrides;
-      setRows((current) => current.filter((row) => !missingIds.has(row.id)));
+      if (missingIds.size) {
+        setRows((current) => current.filter((row) => !missingIds.has(row.id)));
+      }
       setDraft((current) => {
         const nextDetailRows = { ...(current.detailRows || {}) };
-        missingIds.forEach((rowId) => delete nextDetailRows[rowId]);
+        resetIds.forEach((rowId) => delete nextDetailRows[rowId]);
         return { ...current, detailRows: nextDetailRows };
       });
       invalidatePageSwitchCache();
@@ -8392,6 +8437,11 @@ export default function App() {
     if (missingRows.length) {
       parts.push(
         `${missingRows.length} 条明细已不在本装车单的待装列表（${describeDetailRows(missingRows)}，可能已被装走或删除），已从列表移除`
+      );
+    }
+    if (extraRows.length) {
+      parts.push(
+        `${extraRows.length} 条明细屏幕上未勾选、明道云里却仍是勾选（${describeDetailRows(extraRows)}），会被一起装走，已刷新为明道云的实际状态并标红，请核对后再点装载`
       );
     }
     setSaveStatus(`本次未装载：${parts.join("；")}`);
@@ -8436,7 +8486,7 @@ export default function App() {
 
     // 针对“装载 5 个上来 2 个”的静默丢单：对不上先自动补写一次，仍对不上就不装载。
     const verification = await verifyCheckedRowsPersisted();
-    if (verification && (verification.unsavedRows.length || verification.missingRows.length)) {
+    if (hasUnverifiedLoadingRows(verification)) {
       return verification;
     }
 
@@ -8838,8 +8888,12 @@ export default function App() {
         setSaveStatus(syncError?.message || "明细尚未全部写入，已停止装载，请重试");
         return;
       }
-      if (verification && (verification.unsavedRows.length || verification.missingRows.length)) {
+      if (hasUnverifiedLoadingRows(verification)) {
         stopLoadingForUnverifiedRows(verification);
+        return;
+      }
+      if (verification && !verification.verifiedIds.length) {
+        setSaveStatus("请先勾选要装载的明细");
         return;
       }
       setUnsavedRowIds((current) => (current.size ? new Set() : current));

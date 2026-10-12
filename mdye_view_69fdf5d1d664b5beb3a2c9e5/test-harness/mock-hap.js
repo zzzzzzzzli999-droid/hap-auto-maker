@@ -9,6 +9,7 @@
 //   omit=1           关联列表里不返回查询/公式字段（真实明道云的列表接口常常这样），触发插件逐条补读
 //   silent=rowId,..  这些明细的写入“返回成功但不落库”（明道云被业务规则拦截时就是这样）
 //   silentonce=...   同上，但只吞掉第一次写入
+//   silentuncheck=.. 这些明细“取消勾选”的写入返回成功但不落库（勾选仍正常保存）
 //   slowwrite=ms     明细写入额外耗时（模拟勾选后马上点装载、写入还没回来）
 //   account=deep     当前账号姓名不放在 config.currentAccount，只能靠深度搜索 config 找到
 //   toparea=31       主表“在装平方”的字段类型（31 公式 / 6 数值）
@@ -21,6 +22,7 @@
   const OMIT = params.get("omit") !== "0";
   const SILENT = new Set((params.get("silent") || "").split(",").filter(Boolean));
   const SILENT_ONCE = new Set((params.get("silentonce") || "").split(",").filter(Boolean));
+  const SILENT_UNCHECK = new Set((params.get("silentuncheck") || "").split(",").filter(Boolean));
   const SLOW_WRITE = Number(params.get("slowwrite") || 0);
   const ACCOUNT_DEEP = params.get("account") === "deep";
   const TOP_AREA_TYPE = Number(params.get("toparea") || 31);
@@ -306,6 +308,9 @@
       if (!store) return { resultCode: 1, data: {} };
       if (SILENT.has(p.rowId)) return { resultCode: 1, data: { rowid: p.rowId } };
       if (SILENT_ONCE.has(p.rowId)) { SILENT_ONCE.delete(p.rowId); return { resultCode: 1, data: { rowid: p.rowId } }; }
+      if (SILENT_UNCHECK.has(p.rowId) && (p.newOldControl || []).some((c) => c.controlId === F.checked && c.value === "0")) {
+        return { resultCode: 1, data: { rowid: p.rowId } };
+      }
       (p.newOldControl || []).forEach((control) => {
         const all = p.worksheetId === DETAIL_WS ? detailControls : loadControls;
         const def = all.find((c) => c.controlId === control.controlId);

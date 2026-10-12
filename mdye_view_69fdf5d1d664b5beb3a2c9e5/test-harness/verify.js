@@ -160,6 +160,22 @@ const inRelation = (page, ids) => page.evaluate((list) => list.filter((id) => wi
     await page.close();
   }
 
+  // G. 取消勾选的写入被吞：屏幕上已取消、明道云里仍勾着 → 不能被一起装走
+  {
+    const extra = rowIdOf(41);
+    const page = await open(browser, `rows=80&latency=300&silentuncheck=${extra}`);
+    await setChecked(page, extra, true);
+    await page.waitForTimeout(1200);
+    await setChecked(page, extra, false);
+    await setChecked(page, picks[2], true);
+    await clickLoad(page);
+    await page.waitForTimeout(800);
+    const text = await status(page);
+    check("G 已取消但明道云仍勾着：本次不装载并提示", text.includes("本次未装载") && text.includes("仍是勾选"), text);
+    check("G 没有把已取消的明细装上车", !(await loaded(page)).includes(extra));
+    await page.close();
+  }
+
   // F. 后台补读期间勾选：保存开始后不再派发新的补读请求，保存不用排在几十个补读后面
   {
     const page = await open(browser, "rows=80&latency=800&conn=2");
