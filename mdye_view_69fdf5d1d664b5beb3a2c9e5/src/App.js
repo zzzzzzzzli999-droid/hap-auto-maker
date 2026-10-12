@@ -195,7 +195,26 @@ function buildCheckedControlValue(controlId, checked, type) {
   return buildControlValue(controlId, checked ? "是" : "", type);
 }
 
+// 性能：表格每渲染一个格子都会经 isRowLoadedByAnotherAccount 调到这里。运行时没有
+// 直接给出姓名时，getRuntimeContextValue 会递归遍历整个运行时配置（含字段模板）
+// 并逐个尝试 JSON.parse，一次几十毫秒，乘以格子数就是勾选时的明显卡顿。
+// 同一个插件页面里登录账号不会变：拿到 accountId 后永久复用；拿不到时 2 秒内复用。
+let currentAccountInfoCache = null;
+let currentAccountInfoCachedAt = 0;
 function getCurrentAccountInfo() {
+  const now = Date.now();
+  if (
+    currentAccountInfoCache &&
+    (currentAccountInfoCache.accountId || now - currentAccountInfoCachedAt < 2000)
+  ) {
+    return currentAccountInfoCache;
+  }
+  currentAccountInfoCache = Object.freeze(readCurrentAccountInfo());
+  currentAccountInfoCachedAt = now;
+  return currentAccountInfoCache;
+}
+
+function readCurrentAccountInfo() {
   const browserContext = typeof window !== "undefined" ? window : {};
   // Mingdao keeps the signed-in organisation member in one of these runtime
   // objects.  Prefer that member object over generic config values, because a
@@ -1234,6 +1253,10 @@ const VirtualDetailRow = styled.tr`
   ${(props) => props.$locked ? `
     td { background: #fff3db !important; }
   ` : ""}
+
+  ${(props) => props.$unsaved ? `
+    td { background: #ffe4e6 !important; color: #9f1239; }
+  ` : ""}
 `;
 
 const VirtualSpacerCell = styled.td`
@@ -2166,16 +2189,26 @@ async function getWorksheetInfoCached(worksheetId, options = {}) {
   return worksheetInfoCache.get(key);
 }
 
+// App 每次渲染都会取这三个 ID；插件页面的应用/工作表/视图在生命周期内不变，
+// 取到非空值后复用，避免取不到时每次渲染都深度遍历运行时配置。
+const runtimeIdCache = new Map();
+function getCachedRuntimeContextValue(cacheKey, candidateKeys) {
+  if (runtimeIdCache.has(cacheKey)) return runtimeIdCache.get(cacheKey);
+  const value = getRuntimeContextValue(candidateKeys);
+  if (value) runtimeIdCache.set(cacheKey, value);
+  return value;
+}
+
 function getRuntimeAppId() {
-  return getRuntimeContextValue(["appId", "projectId"]);
+  return getCachedRuntimeContextValue("appId", ["appId", "projectId"]);
 }
 
 function getRuntimeWorksheetId() {
-  return getRuntimeContextValue(["worksheetId", "worksheetID", "wsId"]);
+  return getCachedRuntimeContextValue("worksheetId", ["worksheetId", "worksheetID", "wsId"]);
 }
 
 function getRuntimeViewId() {
-  return getRuntimeContextValue(["viewId", "viewID", "worksheetViewId"]);
+  return getCachedRuntimeContextValue("viewId", ["viewId", "viewID", "worksheetViewId"]);
 }
 
 function getDraftStorageKey(viewId, worksheetId, userKey) {
@@ -2530,8 +2563,34 @@ function scheduleAfterFirstPaint(callback, delay = RELATION_BACKGROUND_DELAY) {
   };
 }
 
+// 前台操作让路：勾选/装载量保存、主表合计保存、装载流程进行中时，后台逐条补读
+// 明细（每条一次 getRowDetail/getRowRelationRows，几十到上百个请求）暂停派发新请求。
+// 插件的所有接口都经同一条通道转发给明道云；补读占满通道时，操作员勾选后的
+// 保存和装载前的核对都要排队，实测通道拥挤时装载从 2 秒拖到十几秒乃至一分多钟。
+let foregroundWorkCount = 0;
+let foregroundIdleWaiters = [];
+function beginForegroundWork() {
+  foregroundWorkCount += 1;
+  let ended = false;
+  return () => {
+    if (ended) return;
+    ended = true;
+    foregroundWorkCount = Math.max(0, foregroundWorkCount - 1);
+    if (foregroundWorkCount) return;
+    const waiters = foregroundIdleWaiters;
+    foregroundIdleWaiters = [];
+    waiters.forEach((resolve) => resolve());
+  };
+}
+
+function waitForForegroundIdle() {
+  if (!foregroundWorkCount) return Promise.resolve();
+  return new Promise((resolve) => foregroundIdleWaiters.push(resolve));
+}
+
 // Related records can be numerous. Keeping the background enrichment queue
 // bounded prevents it from competing with the first screen's rendering.
+// 只用于后台补读显示字段；每取一条之前先等前台操作结束。
 async function mapWithConcurrency(items, concurrency, mapper, shouldCancel = () => false) {
   const list = Array.isArray(items) ? items : [];
   // Preserve the original row for work that is intentionally skipped after a
@@ -2544,6 +2603,8 @@ async function mapWithConcurrency(items, concurrency, mapper, shouldCancel = () 
     Array.from({ length: workerCount }, async () => {
       while (nextIndex < list.length) {
         if (shouldCancel()) break;
+        await waitForForegroundIdle();
+        if (shouldCancel() || nextIndex >= list.length) break;
         const index = nextIndex;
         nextIndex += 1;
         results[index] = await mapper(list[index], index);
@@ -2906,8 +2967,19 @@ function getNumberValueOrNull(source, controlId) {
   return null;
 }
 
+// 性能：normalizeDetailRows 对每条明细、每个字段名候选都要把整张明细表的字段
+// （上百个）重新规范化一遍，250 条明细时仅这一项就把浏览器卡住 2 秒以上，
+// 是“页面无响应”的主要来源。字段名是有限集合，规范化结果按原文缓存。
+const normalizedFieldNameCache = new Map();
 function normalizeFieldName(name) {
-  return String(name || "").replace(/\s+/g, "").replace(/棱/g, "楞").trim();
+  const text = String(name || "");
+  let normalized = normalizedFieldNameCache.get(text);
+  if (normalized === undefined) {
+    normalized = text.replace(/\s+/g, "").replace(/棱/g, "楞").trim();
+    if (normalizedFieldNameCache.size > 20000) normalizedFieldNameCache.clear();
+    normalizedFieldNameCache.set(text, normalized);
+  }
+  return normalized;
 }
 
 function getControlName(control) {
@@ -2952,7 +3024,25 @@ function isExcludedFieldName(name, excludeNames = []) {
   return excludeNames.some((excludeName) => normalizedName.includes(normalizeFieldName(excludeName)));
 }
 
+// 同一个字段模板数组（接口返回或 mergeControls 生成，之后不再修改）按“候选名+排除名”
+// 查字段的结果固定不变。normalizeDetailRows 会对每一行用同样的参数重复查询，
+// 这里按数组身份缓存，结果与逐次查找完全相同。
+const controlsByNamesCache = new WeakMap();
 function findControlByNames(controls, names, excludeNames = []) {
+  if (!Array.isArray(controls)) return findControlByNamesUncached(controls, names, excludeNames);
+  let cache = controlsByNamesCache.get(controls);
+  if (!cache) {
+    cache = new Map();
+    controlsByNamesCache.set(controls, cache);
+  }
+  const cacheKey = `${names.join("\u0001")}\u0002${excludeNames.join("\u0001")}\u0002${controls.length}`;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+  const matched = findControlByNamesUncached(controls, names, excludeNames);
+  cache.set(cacheKey, matched);
+  return matched;
+}
+
+function findControlByNamesUncached(controls, names, excludeNames = []) {
   const safeControls = Array.isArray(controls) ? controls : [];
   const normalizedNames = names.map(normalizeFieldName).filter(Boolean);
   const candidates = safeControls.filter((control) => {
@@ -2992,7 +3082,8 @@ function getCellByNames(source, names, excludeNames = []) {
   const cells = getCellsFromRow(source);
   if (!Array.isArray(cells) || !cells.length) return null;
   return (
-    findControlByNames(
+    // 每次都是新映射出来的数组，缓存命中不了，直接查找。
+    findControlByNamesUncached(
       cells.map((cell) => ({
         ...cell,
         controlName: getControlName(cell),
@@ -5313,6 +5404,75 @@ function buildHeaderRows(columns) {
   return { topRow, secondRow };
 }
 
+function buildDisplayRows(rows, detailRowDrafts) {
+  const rowDrafts = detailRowDrafts || {};
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    const rowDraft = rowDrafts[row.id] || {};
+    const checked =
+      rowDraft.checked === undefined ? !!row.checked : !!rowDraft.checked;
+    const hasLoadedQtyDraft = rowDraft.loadedQty !== undefined;
+    const loadedQty =
+      hasLoadedQtyDraft ? Number(rowDraft.loadedQty) || 0 : row.loadedQty;
+    return {
+      ...row,
+      checked,
+      loadedQty,
+      remark: rowDraft.remark === undefined ? row.remark : rowDraft.remark,
+      loadedVolume: calculateLoadingVolume(row, loadedQty),
+      loadedArea: hasLoadedQtyDraft
+        ? calculateLoadingArea(row, loadedQty)
+        : row.loadedArea || calculateLoadingArea(row, loadedQty),
+    };
+  });
+}
+
+function computeLoadingTotals(displayRows) {
+  // 顶部"在装平方/在装立方"只统计当前登录人自己装的明细：装载人和当前账号（姓名或
+  // 账号ID）对不上的行——包括还没人装、或者是别人之前装的——一律记 0，不计入合计，
+  // 避免把别的操作人/别的批次已经装好的数量也算进这一次的进度里。
+  const currentAccount = getCurrentAccountInfo();
+  const currentLoaderCandidates = [currentAccount.fullname, currentAccount.accountId]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return displayRows.reduce(
+    (accumulator, row) => {
+      const belongsToCurrentLoader =
+        currentLoaderCandidates.length > 0 &&
+        currentLoaderCandidates.includes(String(row.loadingUser || "").trim());
+      return {
+        plannedQty: accumulator.plannedQty + row.plannedQty,
+        inventoryQty: accumulator.inventoryQty + row.inventoryQty,
+        plannedVolume: accumulator.plannedVolume + row.plannedVolume,
+        inventoryVolume: accumulator.inventoryVolume + row.inventoryVolume,
+        plannedArea: accumulator.plannedArea + row.plannedArea,
+        inventoryArea: accumulator.inventoryArea + row.inventoryArea,
+        loadedQty: accumulator.loadedQty + (belongsToCurrentLoader ? row.loadedQty : 0),
+        loadedVolume: accumulator.loadedVolume + (belongsToCurrentLoader ? row.loadedVolume : 0),
+        loadedArea: accumulator.loadedArea + (belongsToCurrentLoader ? row.loadedArea : 0),
+      };
+    },
+    {
+      plannedQty: 0,
+      inventoryQty: 0,
+      plannedVolume: 0,
+      inventoryVolume: 0,
+      plannedArea: 0,
+      inventoryArea: 0,
+      loadedQty: 0,
+      loadedVolume: 0,
+      loadedArea: 0,
+    }
+  );
+}
+
+function describeDetailRows(rows) {
+  return rows
+    .map((row) => row?.productName || row?.workOrder || row?.model || row?.id || "")
+    .filter(Boolean)
+    .slice(0, 5)
+    .join("、");
+}
+
 export default function App() {
   const appId = getRuntimeAppId();
   const worksheetId = getRuntimeWorksheetId();
@@ -5362,6 +5522,7 @@ export default function App() {
   const [filters, setFilters] = useState(() => initialDraft.filters || { summary: {}, detail: {} });
   const [activeColumnFilter, setActiveColumnFilter] = useState(null);
   const [draft, setDraft] = useState(() => initialDraft);
+  const draftRef = useRef(draft);
   const [buttons, setButtons] = useState([]);
   const [selectedButtonId, setSelectedButtonId] = useState("");
   const [runningActionName, setRunningActionName] = useState("");
@@ -5387,8 +5548,9 @@ export default function App() {
   // 明细关联字段的 controlId。装载前要用它重新把明细从服务端读回来，
   // 校验“勾选/装载量”是否真的落库（明道云写入接口返回成功 ≠ 已保存）。
   const detailRelationControlIdRef = useRef("");
-  // 装载前校验发现仍未落库的明细提示，等工作流跑完再显示，避免被中途的状态文案覆盖。
-  const unpersistedWarningRef = useRef("");
+  // 装载前核对时明道云里没保存上的明细：保留勾选、整行标红，直到操作员重新勾选/
+  // 取消，或下一次核对通过。
+  const [unsavedRowIds, setUnsavedRowIds] = useState(() => new Set());
   const pendingTopTotalsRef = useRef(null);
   const topTotalsSyncTimerRef = useRef(null);
   const topDateSyncPromiseRef = useRef(null);
@@ -5405,6 +5567,9 @@ export default function App() {
   useEffect(() => {
     rowsRef.current = rows;
   }, [rows]);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
   const normalizedTopColumns = useMemo(() => mergeColumns(TOP_COLUMNS, topColumns), [topColumns]);
   const normalizedSummaryColumns = useMemo(
     () => mergeColumns(SUMMARY_COLUMNS, summaryColumns),
@@ -5497,6 +5662,12 @@ export default function App() {
 
   function updateLocalDetailLoaded(row, loadedQty, checked, loadingUser) {
     const nextLoadedQty = Number(loadedQty) || 0;
+    setUnsavedRowIds((current) => {
+      if (!current.has(row.id)) return current;
+      const next = new Set(current);
+      next.delete(row.id);
+      return next;
+    });
     updateLocalDetailRow(row.id, {
       checked,
       loadedQty: nextLoadedQty,
@@ -5579,6 +5750,8 @@ export default function App() {
   function queueDetailSync(rowId, task) {
     const previousSync = detailSyncPromisesRef.current.get(rowId);
     detailSyncErrorsRef.current.delete(rowId);
+    // 从点下勾选的这一刻起，后台补读就不再派发新请求，保存不用排在补读后面。
+    const endForegroundWork = beginForegroundWork();
     const nextSync = runAfterInteractionPaint(async () => {
       if (previousSync) {
         try {
@@ -5603,6 +5776,7 @@ export default function App() {
         throw lastError;
       });
     });
+    nextSync.then(endForegroundWork, endForegroundWork);
     return trackDetailSync(rowId, nextSync);
   }
 
@@ -5636,6 +5810,7 @@ export default function App() {
     workflowHiddenRowIdsRef.current.clear();
     detailSyncPromisesRef.current.clear();
     detailSyncErrorsRef.current.clear();
+    setUnsavedRowIds((current) => (current.size ? new Set() : current));
   }, [sourceRowId, worksheetId]);
 
   useEffect(() => {
@@ -6361,27 +6536,16 @@ export default function App() {
     };
   }, [appId, sourceRowId, viewId, worksheetId]);
 
-  const displayRows = useMemo(() => {
-    const rowDrafts = draft.detailRows || {};
-    return rows.map((row) => {
-      const rowDraft = rowDrafts[row.id] || {};
-      const checked =
-        rowDraft.checked === undefined ? !!row.checked : !!rowDraft.checked;
-      const hasLoadedQtyDraft = rowDraft.loadedQty !== undefined;
-      const loadedQty =
-        hasLoadedQtyDraft ? Number(rowDraft.loadedQty) || 0 : row.loadedQty;
-      return {
-        ...row,
-        checked,
-        loadedQty,
-        remark: rowDraft.remark === undefined ? row.remark : rowDraft.remark,
-        loadedVolume: calculateLoadingVolume(row, loadedQty),
-        loadedArea: hasLoadedQtyDraft
-          ? calculateLoadingArea(row, loadedQty)
-          : row.loadedArea || calculateLoadingArea(row, loadedQty),
-      };
-    });
-  }, [draft.detailRows, rows]);
+  const displayRows = useMemo(
+    () => buildDisplayRows(rows, draft.detailRows),
+    [draft.detailRows, rows]
+  );
+
+  // 装载流程要跑好几秒，期间数据可能被重新加载。核对和隐藏都必须基于“此刻”的
+  // 行，而不是点击装载那一次渲染时闭包里的 displayRows。
+  function getLatestDisplayRows() {
+    return buildDisplayRows(rowsRef.current, draftRef.current?.detailRows);
+  }
 
   const boardRows = useMemo(
     () => displayRows.filter((row) => row.hasBoard !== false),
@@ -6529,44 +6693,7 @@ export default function App() {
     [filteredDetailRows]
   );
 
-  const totals = useMemo(() => {
-    // 顶部"在装平方/在装立方"只统计当前登录人自己装的明细：装载人和当前账号（姓名或
-    // 账号ID）对不上的行——包括还没人装、或者是别人之前装的——一律记 0，不计入合计，
-    // 避免把别的操作人/别的批次已经装好的数量也算进这一次的进度里。
-    const currentAccount = getCurrentAccountInfo();
-    const currentLoaderCandidates = [currentAccount.fullname, currentAccount.accountId]
-      .map((value) => String(value || "").trim())
-      .filter(Boolean);
-    return displayRows.reduce(
-      (accumulator, row) => {
-        const belongsToCurrentLoader =
-          currentLoaderCandidates.length > 0 &&
-          currentLoaderCandidates.includes(String(row.loadingUser || "").trim());
-        return {
-          plannedQty: accumulator.plannedQty + row.plannedQty,
-          inventoryQty: accumulator.inventoryQty + row.inventoryQty,
-          plannedVolume: accumulator.plannedVolume + row.plannedVolume,
-          inventoryVolume: accumulator.inventoryVolume + row.inventoryVolume,
-          plannedArea: accumulator.plannedArea + row.plannedArea,
-          inventoryArea: accumulator.inventoryArea + row.inventoryArea,
-          loadedQty: accumulator.loadedQty + (belongsToCurrentLoader ? row.loadedQty : 0),
-          loadedVolume: accumulator.loadedVolume + (belongsToCurrentLoader ? row.loadedVolume : 0),
-          loadedArea: accumulator.loadedArea + (belongsToCurrentLoader ? row.loadedArea : 0),
-        };
-      },
-      {
-        plannedQty: 0,
-        inventoryQty: 0,
-        plannedVolume: 0,
-        inventoryVolume: 0,
-        plannedArea: 0,
-        inventoryArea: 0,
-        loadedQty: 0,
-        loadedVolume: 0,
-        loadedArea: 0,
-      }
-    );
-  }, [displayRows]);
+  const totals = useMemo(() => computeLoadingTotals(displayRows), [displayRows]);
 
   const currentTruckText = formatTruckText(truckOptions, selectedTruckId);
   const currentTruckDriver = formatTruckDriver(truckOptions, selectedTruckId);
@@ -7343,9 +7470,12 @@ export default function App() {
       const patch = pendingTopTotalsRef.current;
       pendingTopTotalsRef.current = null;
       if (!patch) return;
-      syncTopFieldsToMingdao(patch).catch((error) => {
-        console.warn("sync aggregated loading totals failed", error);
-      });
+      const endForegroundWork = beginForegroundWork();
+      syncTopFieldsToMingdao(patch)
+        .catch((error) => {
+          console.warn("sync aggregated loading totals failed", error);
+        })
+        .finally(endForegroundWork);
     }, 500);
   }
 
@@ -7835,22 +7965,7 @@ export default function App() {
     setLoadingVolume(nextLoadingVolume);
     setLoadedVolume(nextLoadingVolume);
     setLoadingArea(nextLoadingArea);
-
-    const pageCacheKey = getPageSwitchCacheKey({
-      worksheetId,
-      viewId,
-      recordRowId,
-      filters: systemFilters,
-    });
-    const latestPageCacheKey = getLatestPageSwitchCacheKey({ worksheetId, viewId, recordRowId });
-    pageSwitchCache.delete(pageCacheKey);
-    pageSwitchCache.delete(latestPageCacheKey);
-    try {
-      window.sessionStorage?.removeItem(pageCacheKey);
-      window.sessionStorage?.removeItem(latestPageCacheKey);
-    } catch (error) {
-      // Cache invalidation is best-effort; the server refresh remains authoritative.
-    }
+    invalidatePageSwitchCache();
 
     return { nextLoadingVolume, nextLoadingArea };
   }
@@ -8098,7 +8213,7 @@ export default function App() {
     const failedRowIds = Array.from(detailSyncErrorsRef.current.keys());
     if (!failedRowIds.length) return;
 
-    const latestRows = new Map(displayRows.map((row) => [row.id, row]));
+    const latestRows = new Map(getLatestDisplayRows().map((row) => [row.id, row]));
     const retryPromises = failedRowIds.map((rowId) => {
       const row = latestRows.get(rowId);
       if (!row) return Promise.reject(new Error(`未找到待重试明细：${rowId}`));
@@ -8137,9 +8252,10 @@ export default function App() {
       fetchAll: true,
     });
     const serverRows = normalizeDetailRows(relation.rows || [], relation.controls || []);
+    // 一条都读不回来时无法区分“全部被装走”与“接口没返回”，交给调用方按无法核对处理。
     if (!serverRows.length) return null;
     // 解析不到勾选字段时，serverRow.checked 会退化成“装载量>0”的推断值，
-    // 不足以作为判据。此时跳过校验，保持原有行为，绝不误拦装载。
+    // 不足以作为判据。此时跳过校验，保持原有行为。
     if (!serverRows[0]?.fieldMap?.checked) return null;
 
     const stateByRowId = new Map();
@@ -8152,66 +8268,133 @@ export default function App() {
     return stateByRowId;
   }
 
+  // 屏幕上勾了几条，明道云里就必须真有几条（勾选=是、装载量一致），否则不触发装载。
+  // 装载工作流只认服务器上已勾选的明细。以前这里核对不上只提示、照常装载，随后又把
+  // 没装上的行从列表里藏掉——这就是“勾上了记录，点装载却丢了”（视频里的
+  // “注意：1 条明细未写入明道云…”）。现在核对不上就停下：勾选全部保留、整行标红。
+  // 返回：
+  //   { verifiedIds, unsavedRows, missingRows }
+  //     verifiedIds  服务器已确认勾选的明细，工作流装走的就是这些
+  //     unsavedRows  自动补写一次后，服务器上仍未勾上或装载量不一致
+  //     missingRows  已不在本装车单的待装明细里（被别人装走、退回或删除）
+  //   null  无法核对（读不回明细或解析不到勾选字段），沿用原有行为
   async function verifyCheckedRowsPersisted() {
-    const expected = displayRows
-      .filter((row) => !!row.checked && !isRowLoadedByAnotherAccount(row))
-      .map((row) => ({ id: row.id, loadedQty: Number(row.loadedQty) || 0 }));
-    if (!expected.length) return;
-
-    const rowById = new Map(displayRows.map((row) => [row.id, row]));
-    const describeRows = (ids) =>
-      ids
-        .map((id) => rowById.get(id))
-        .map((row) => row?.productName || row?.workOrder || row?.model || row?.id || "")
-        .filter(Boolean)
-        .slice(0, 5)
-        .join("、");
-
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const expectedRows = getLatestDisplayRows().filter(
+        (row) => !!row.checked && !isRowLoadedByAnotherAccount(row)
+      );
+      if (!expectedRows.length) return { verifiedIds: [], unsavedRows: [], missingRows: [] };
+
       let serverState = null;
-      try {
-        serverState = await readServerDetailCheckedState();
-      } catch (error) {
-        // 回读失败只是诊断能力下降，不能把正常的装载拦住。
-        console.warn("read back detail state before loading failed", error);
-        return;
+      let readError = null;
+      for (let readAttempt = 0; readAttempt < 2; readAttempt += 1) {
+        try {
+          serverState = await readServerDetailCheckedState();
+          readError = null;
+          break;
+        } catch (error) {
+          readError = error;
+          console.warn("read back detail state before loading failed", error);
+          if (readAttempt === 0) await waitForMs(600);
+        }
       }
-      if (!serverState) return;
+      if (readError) {
+        // 读不回来就无法保证不丢单：宁可这次不装，也不在不确定时触发工作流。
+        throw new Error("暂时无法向明道云核对勾选是否已保存（网络异常），本次未装载，请稍后再点装载");
+      }
+      if (!serverState) return null;
 
-      const mismatchedIds = expected
-        .filter((item) => {
-          const actual = serverState.get(item.id);
-          if (!actual || !actual.checked) return true;
-          return Math.abs(actual.loadedQty - item.loadedQty) > 1e-6;
-        })
-        .map((item) => item.id);
-      if (!mismatchedIds.length) return;
-
-      if (attempt > 0) {
-        // 补写后仍然对不上：只提示，不拦截。装载流程保持与现在完全一致，
-        // 避免因为校验环节挡住正常装车。
-        console.warn("detail rows still not persisted before loading", mismatchedIds);
-        // 后续还会多次改写状态栏，这里记在 ref 里，装载结束后再显示出来。
-        unpersistedWarningRef.current = `注意：${mismatchedIds.length} 条明细未写入明道云（${describeRows(mismatchedIds)}），本次装载可能不含这些明细，请核对后用“补装”补上`;
-        return;
+      const missingRows = expectedRows.filter((row) => !serverState.has(row.id));
+      const unsavedRows = expectedRows.filter((row) => {
+        const actual = serverState.get(row.id);
+        if (!actual) return false;
+        if (!actual.checked) return true;
+        return Math.abs(actual.loadedQty - (Number(row.loadedQty) || 0)) > 1e-6;
+      });
+      if (!unsavedRows.length || attempt > 0) {
+        if (unsavedRows.length || missingRows.length) {
+          console.warn("detail rows not persisted before loading", {
+            unsaved: unsavedRows.map((row) => row.id),
+            missing: missingRows.map((row) => row.id),
+          });
+        }
+        const problemIds = new Set([...unsavedRows, ...missingRows].map((row) => row.id));
+        return {
+          verifiedIds: expectedRows.map((row) => row.id).filter((rowId) => !problemIds.has(rowId)),
+          unsavedRows,
+          missingRows,
+        };
       }
 
-      setSaveStatus(`检测到 ${mismatchedIds.length} 条明细未写入明道云，正在重写...`);
+      setSaveStatus(`检测到 ${unsavedRows.length} 条明细未写入明道云，正在重写...`);
       await Promise.allSettled(
-        mismatchedIds.map((rowId) => {
-          const row = rowById.get(rowId);
-          if (!row) return Promise.resolve();
-          return queueDetailSync(rowId, () =>
+        unsavedRows.map((row) =>
+          queueDetailSync(row.id, () =>
             syncDetailLoadedToMingdao(row, row.loadedQty, {
               syncChecked: true,
               checked: true,
               syncTop: false,
             })
-          );
-        })
+          )
+        )
       );
       await waitForPendingDetailSyncs();
     }
+    return null;
+  }
+
+  function invalidatePageSwitchCache() {
+    const pageCacheKey = getPageSwitchCacheKey({
+      worksheetId,
+      viewId,
+      recordRowId,
+      filters: systemFilters,
+    });
+    const latestPageCacheKey = getLatestPageSwitchCacheKey({ worksheetId, viewId, recordRowId });
+    pageSwitchCache.delete(pageCacheKey);
+    pageSwitchCache.delete(latestPageCacheKey);
+    try {
+      window.sessionStorage?.removeItem(pageCacheKey);
+      window.sessionStorage?.removeItem(latestPageCacheKey);
+    } catch (error) {
+      // Cache invalidation is best-effort; the server refresh remains authoritative.
+    }
+  }
+
+  // 核对不通过时停在装载前：标红没保存上的行（勾选保留），移除已不在待装列表的行，
+  // 并用一句话告诉操作员哪几条、怎么处理。
+  function stopLoadingForUnverifiedRows({ unsavedRows, missingRows }) {
+    setUnsavedRowIds(new Set(unsavedRows.map((row) => row.id)));
+    if (missingRows.length) {
+      const missingIds = new Set(missingRows.map((row) => row.id));
+      const nextOverrides = { ...localDetailOverridesRef.current };
+      missingIds.forEach((rowId) => {
+        delete nextOverrides[rowId];
+        detailSyncPromisesRef.current.delete(rowId);
+        detailSyncErrorsRef.current.delete(rowId);
+      });
+      localDetailOverridesRef.current = nextOverrides;
+      setRows((current) => current.filter((row) => !missingIds.has(row.id)));
+      setDraft((current) => {
+        const nextDetailRows = { ...(current.detailRows || {}) };
+        missingIds.forEach((rowId) => delete nextDetailRows[rowId]);
+        return { ...current, detailRows: nextDetailRows };
+      });
+      invalidatePageSwitchCache();
+      setRefreshVersion((current) => current + 1);
+    }
+    const parts = [];
+    if (unsavedRows.length) {
+      parts.push(
+        `${unsavedRows.length} 条明细的勾选/装载量没有存进明道云（${describeDetailRows(unsavedRows)}），已标红保留；请重新勾选后再点装载，仍保存不上请先取消这几条`
+      );
+    }
+    if (missingRows.length) {
+      parts.push(
+        `${missingRows.length} 条明细已不在本装车单的待装列表（${describeDetailRows(missingRows)}，可能已被装走或删除），已从列表移除`
+      );
+    }
+    setSaveStatus(`本次未装载：${parts.join("；")}`);
   }
 
   async function syncCurrentViewToMingdao() {
@@ -8221,13 +8404,14 @@ export default function App() {
     await waitForPendingDetailSyncs();
     await retryFailedDetailSyncs();
 
-    const dirtyRows = displayRows.filter((row) => {
-      const rowDraft = draft.detailRows?.[row.id] || {};
+    const draftRows = draftRef.current?.detailRows || {};
+    const dirtyRows = getLatestDisplayRows().filter((row) => {
+      const rowDraft = draftRows[row.id] || {};
       return rowDraft.loadedQty !== undefined || rowDraft.checked !== undefined || rowDraft.remark !== undefined;
     });
 
     await Promise.all(dirtyRows.map(async (row) => {
-      const rowDraft = draft.detailRows?.[row.id] || {};
+      const rowDraft = draftRows[row.id] || {};
       const pendingSync = detailSyncPromisesRef.current.get(row.id);
       if (pendingSync) {
         await pendingSync;
@@ -8250,17 +8434,20 @@ export default function App() {
       }
     }));
 
-    // 屏幕上勾了几条，明道云就该有几条。对不上先自动补写一次，
-    // 补上了照常装载；补不上也不拦截，只在装载后给出提示。
-    // 针对“装载 5 个上来 2 个”的静默丢单。
-    await verifyCheckedRowsPersisted();
+    // 针对“装载 5 个上来 2 个”的静默丢单：对不上先自动补写一次，仍对不上就不装载。
+    const verification = await verifyCheckedRowsPersisted();
+    if (verification && (verification.unsavedRows.length || verification.missingRows.length)) {
+      return verification;
+    }
 
-    setLoadingVolume(totals.loadedVolume);
-    setLoadingArea(totals.loadedArea);
+    const latestTotals = computeLoadingTotals(getLatestDisplayRows());
+    setLoadingVolume(latestTotals.loadedVolume);
+    setLoadingArea(latestTotals.loadedArea);
     await syncTopFieldsToMingdao({
-      loadedVolume: totals.loadedVolume,
-      loadingArea: totals.loadedArea,
+      loadedVolume: latestTotals.loadedVolume,
+      loadingArea: latestTotals.loadedArea,
     });
+    return verification;
   }
 
   async function loadSupplementOrderOptions() {
@@ -8548,11 +8735,16 @@ export default function App() {
     }
   }
 
-  function hideCompletedLoadingRowsAfterWorkflow() {
-    const completedRowIds = displayRows
-      .filter((row) => !!row.checked && !isRowLoadedByAnotherAccount(row))
-      .map((row) => row.id)
-      .filter(Boolean);
+  // 只隐藏装载前核对时服务器已确认勾选的明细——工作流装走的正是这些。
+  // 无法核对时（verifiedIds 为 null）沿用原逻辑：隐藏此刻本账号勾选的明细。
+  function hideCompletedLoadingRowsAfterWorkflow(verifiedIds = null) {
+    const completedRowIds = (
+      Array.isArray(verifiedIds)
+        ? verifiedIds
+        : getLatestDisplayRows()
+            .filter((row) => !!row.checked && !isRowLoadedByAnotherAccount(row))
+            .map((row) => row.id)
+    ).filter(Boolean);
     if (!completedRowIds.length) return;
 
     const completedIdSet = new Set(completedRowIds);
@@ -8575,6 +8767,8 @@ export default function App() {
     setLoadingVolume(0);
     setLoadedVolume(0);
     setLoadingArea(0);
+    // 已装走的行不能再从页面缓存里“复活”：马上切走再切回时，缓存里还是装载前的行。
+    invalidatePageSwitchCache();
 
     // The workflow response means Mingdao accepted the action, while its row
     // updates can still take a moment. Keep completed rows hidden locally,
@@ -8622,8 +8816,9 @@ export default function App() {
       return;
     }
 
+    // 整个装载流程期间后台补读暂停，核对和工作流请求不用排在补读后面。
+    const endForegroundWork = beginForegroundWork();
     try {
-      unpersistedWarningRef.current = "";
       setRunningActionName(buttonName);
       setGlobalBusyCursor(true);
       setSaveStatus(
@@ -8634,14 +8829,20 @@ export default function App() {
       // 先让“装载中”完成一次渲染；后续仍使用原有的明细同步和工作流。
       // 顶部日期的后台校验绝不能阻断装载，避免日期字段异常影响装车业务。
       await runAfterInteractionPaint(() => undefined);
+      let verification = null;
       try {
         setSaveStatus("正在同步已勾选的装载明细...");
-        await syncCurrentViewToMingdao();
+        verification = await syncCurrentViewToMingdao();
       } catch (syncError) {
         console.warn("sync current view before workflow failed, stop workflow", syncError);
         setSaveStatus(syncError?.message || "明细尚未全部写入，已停止装载，请重试");
         return;
       }
+      if (verification && (verification.unsavedRows.length || verification.missingRows.length)) {
+        stopLoadingForUnverifiedRows(verification);
+        return;
+      }
+      setUnsavedRowIds((current) => (current.size ? new Set() : current));
       setSaveStatus(
         buttonName === SUPPLEMENT_LOADING_BUTTON_NAME
           ? "正在触发补装流程..."
@@ -8666,13 +8867,14 @@ export default function App() {
         setSaveStatus(`${buttonName}未执行：记录不满足条件或流程未启用`);
         return;
       }
-      hideCompletedLoadingRowsAfterWorkflow();
-      setSaveStatus(unpersistedWarningRef.current || "");
+      hideCompletedLoadingRowsAfterWorkflow(verification ? verification.verifiedIds : null);
+      setSaveStatus("");
       setSystemFilters((current) => ({ ...current }));
     } catch (error) {
       console.warn("start custom button workflow failed", error);
       setSaveStatus(error?.message || `${buttonName}执行失败，请检查按钮权限或工作流配置`);
     } finally {
+      endForegroundWork();
       setRunningActionName("");
       setGlobalBusyCursor(false);
     }
@@ -9395,7 +9597,12 @@ export default function App() {
                         const index = virtualDetailRows.start + offset;
                         const lockedByOtherLoader = isRowLoadedByAnotherAccount(row);
                         return (
-                      <VirtualDetailRow key={row.id} $locked={lockedByOtherLoader}>
+                      <VirtualDetailRow
+                        key={row.id}
+                        $locked={lockedByOtherLoader}
+                        $unsaved={unsavedRowIds.has(row.id)}
+                        title={unsavedRowIds.has(row.id) ? "这条明细的勾选/装载量没有存进明道云，本次未装载；请重新勾选后再点装载" : undefined}
+                      >
                         {visibleDetailColumns.map((column) => {
                           const isLoadColumn = column.key === "checked";
                           const isLoadedQtyColumn = column.key === "loadedQty";
