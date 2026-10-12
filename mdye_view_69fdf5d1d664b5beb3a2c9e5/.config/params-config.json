@@ -1,0 +1,142 @@
+[
+  {
+    "controlName": "送货明细",
+    "controlId": "detailRelation",
+    "type": "field",
+    "subType": "single",
+    "valueType": "array"
+  },
+  {
+    "controlName": "货车",
+    "controlId": "truckRelation",
+    "type": "field",
+    "subType": "single",
+    "valueType": "array"
+  },
+  {
+    "controlName": "可载立方",
+    "controlId": "capacityVolume",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "可载平方",
+    "controlId": "capacityArea",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "在装平方",
+    "controlId": "loadingArea",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "明细在装平方",
+    "controlId": "detailLoadingArea",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "明细装载人",
+    "controlId": "detailLoadingUser",
+    "type": "field",
+    "subType": "single",
+    "valueType": "array"
+  },
+  {
+    "controlName": "明细平方系数",
+    "controlId": "detailAreaCoefficient",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "明细立方系数",
+    "controlId": "detailVolumeCoefficient",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "已载立方",
+    "controlId": "loadedVolume",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "送货日期",
+    "controlId": "deliveryDate",
+    "type": "field",
+    "subType": "single",
+    "valueType": "string"
+  },
+  {
+    "controlName": "选择补装车的单号",
+    "controlId": "supplementOrder",
+    "type": "field",
+    "subType": "single",
+    "valueType": "array"
+  },
+  {
+    "controlName": "明细单价",
+    "controlId": "detailUnitPrice",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "明细生产状态",
+    "controlId": "detailProductionStatus",
+    "type": "field",
+    "subType": "single",
+    "valueType": "string"
+  },
+  {
+    "controlName": "明细总采购量",
+    "controlId": "detailTotalPurchaseQty",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "明细总纸板量",
+    "controlId": "detailTotalBoardQty",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "明细印刷完工",
+    "controlId": "detailPrintCompleted",
+    "type": "field",
+    "subType": "single",
+    "valueType": "string"
+  },
+  {
+    "controlName": "明细成型完工",
+    "controlId": "detailFormingCompleted",
+    "type": "field",
+    "subType": "single",
+    "valueType": "string"
+  },
+  {
+    "controlName": "明细总入库量",
+    "controlId": "detailTotalInboundQty",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  },
+  {
+    "controlName": "明细总出库量",
+    "controlId": "detailTotalOutboundQty",
+    "type": "field",
+    "subType": "single",
+    "valueType": "double"
+  }
+]
